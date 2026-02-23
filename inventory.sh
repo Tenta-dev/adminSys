@@ -30,14 +30,14 @@ readonly EXPORT_DIR="${EXPORT_DIR:-/root/exports}"
 readonly CSV_HEADER="hostname,ip,ssh_port,admin_user,os,type,date_hardening"
 
 # Couleurs
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly BOLD='\033[1m'
-readonly DIM='\033[2m'
-readonly NC='\033[0m'
+readonly RED=$'\033[0;31m'
+readonly GREEN=$'\033[0;32m'
+readonly YELLOW=$'\033[1;33m'
+readonly BLUE=$'\033[0;34m'
+readonly CYAN=$'\033[0;36m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+readonly NC=$'\033[0m'
 
 # Largeurs des colonnes
 readonly COL_HOST=25
@@ -456,7 +456,8 @@ cmd_check() {
 # =============================================================================
 
 show_help() {
-    printf '%b\n' "
+    cat << EOF
+
 ${BOLD}${SCRIPT_NAME}${NC} v${SCRIPT_VERSION} — Gestion d'inventaire infrastructure Proxmox
 
 ${BOLD}USAGE${NC}
@@ -478,7 +479,7 @@ ${BOLD}EXEMPLES${NC}
     ${SCRIPT_NAME} search 192.168.1
     ${SCRIPT_NAME} search lxc
     ${SCRIPT_NAME} add
-    ${SCRIPT_NAME} add lxc-nginx-prod 10.0.0.50 2222 sysadmin \"Debian 12\" lxc
+    ${SCRIPT_NAME} add lxc-nginx-prod 10.0.0.50 2222 sysadmin "Debian 12" lxc
     ${SCRIPT_NAME} remove lxc-nginx-prod
     ${SCRIPT_NAME} export --format md
     ${SCRIPT_NAME} stats
@@ -487,7 +488,8 @@ ${BOLD}EXEMPLES${NC}
 ${BOLD}CONFIGURATION${NC}
     INVENTORY_FILE    Chemin du CSV (défaut: /root/inventaire.csv)
     EXPORT_DIR        Dossier d'export (défaut: /root/exports)
-"
+
+EOF
     exit 0
 }
 

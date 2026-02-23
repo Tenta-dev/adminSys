@@ -37,11 +37,11 @@ readonly SSH_HARDENING_DIR="/etc/ssh/sshd_config.d"
 readonly INVENTORY_DEFAULT="/root/infrastructure-inventory.csv"
 
 # Couleurs pour l'affichage
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+readonly RED=$'\033[0;31m'
+readonly GREEN=$'\033[0;32m'
+readonly YELLOW=$'\033[1;33m'
+readonly BLUE=$'\033[0;34m'
+readonly NC=$'\033[0m' # No Color
 
 # Variables configurables
 ADMIN_USER="admin"
