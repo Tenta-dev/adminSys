@@ -333,12 +333,22 @@ SSHEOF
     # Créer /run/sshd si absent (nécessaire sur les LXC minimalistes)
     run "mkdir -p /run/sshd"
 
-    # Vérification de la config SSH avant rechargement
+    # Ubuntu 24.04+ utilise ssh.socket (activation par socket systemd)
+    # Le socket ignore sshd_config et écoute sur son propre port.
+    # On désactive le socket et on utilise le service classique.
+    if systemctl is-active ssh.socket &>/dev/null || systemctl is-enabled ssh.socket &>/dev/null; then
+        info "ssh.socket détecté (Ubuntu 24.04+). Bascule vers ssh.service..."
+        run "systemctl disable --now ssh.socket"
+        run "systemctl enable ssh.service"
+    fi
+
+    # Vérification de la config SSH avant redémarrage
     if [[ "${DRY_RUN}" == false ]]; then
         local sshd_errors
         if sshd_errors="$(sshd -t 2>&1)"; then
-            run "systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true"
-            success "SSH hardened et rechargé (port ${SSH_PORT})."
+            # Restart (pas reload) : nécessaire pour un changement de port
+            run "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true"
+            success "SSH hardened et redémarré (port ${SSH_PORT})."
         else
             error "La configuration SSH est invalide ! Rollback..."
             error "Détail : ${sshd_errors}"
