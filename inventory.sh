@@ -424,26 +424,37 @@ cmd_check() {
 
     echo ""
     echo -e "${BOLD}🔌 Vérification de la connectivité SSH${NC}"
-    echo ""
+
+    print_header
 
     local ok=0
     local ko=0
 
-    print_header
-
     while IFS=',' read -r hostname ip port user os type date; do
         local status_icon status_color
-        if timeout 5 bash -c "echo > /dev/tcp/${ip}/${port}" 2>/dev/null; then
-            status_icon="✓"
-            status_color="${GREEN}"
-            ((ok++))
+
+        # Test de connectivité TCP via ss/nc/timeout selon ce qui est dispo
+        if command -v nc &>/dev/null; then
+            if nc -z -w 3 "${ip}" "${port}" 2>/dev/null; then
+                status_icon="✓"; status_color="${GREEN}"; ok=$((ok + 1))
+            else
+                status_icon="✗"; status_color="${RED}"; ko=$((ko + 1))
+            fi
+        elif timeout 3 bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null; then
+            status_icon="✓"; status_color="${GREEN}"; ok=$((ok + 1))
         else
-            status_icon="✗"
-            status_color="${RED}"
-            ((ko++))
+            status_icon="✗"; status_color="${RED}"; ko=$((ko + 1))
         fi
 
-        echo -e "${status_color}${status_icon}${NC} $(print_row "${hostname}" "${ip}" "${port}" "${user}" "${os}" "${type}" "${date}")"
+        # Affichage de la ligne avec le statut
+        printf "%b " "${status_color}${status_icon}${NC}"
+        printf "%-${COL_HOST}s " "${hostname}"
+        printf "%-${COL_IP}s " "${ip}"
+        printf "%-${COL_PORT}s " "${port}"
+        printf "%-${COL_USER}s " "${user}"
+        printf "%-${COL_OS}s " "${os}"
+        echo -e "${status_color}$(printf "%-${COL_TYPE}s" "${type}")${NC} ${DIM}${date}${NC}"
+
     done < <(tail -n +2 "${INVENTORY_FILE}" | grep '[^[:space:]]' || true)
 
     print_separator
