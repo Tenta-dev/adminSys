@@ -49,6 +49,8 @@ SSH_KEY=""
 SSH_PORT="22"
 NEW_HOSTNAME=""
 INVENTORY_FILE="${INVENTORY_DEFAULT}"
+PROXMOX_HOST=""
+PROXMOX_INVENTORY="/root/inventaire.csv"
 ENABLE_FAIL2BAN=true
 ENABLE_UFW=true
 ENABLE_UNATTENDED=true
@@ -146,7 +148,8 @@ Options :
   -k, --ssh-key <path|url>    Clé publique SSH (fichier local ou URL)
   -p, --ssh-port <port>       Port SSH (défaut: 22)
   -h, --hostname <name>       Nom d'hôte à configurer
-  -i, --inventory <path>      Fichier d'inventaire CSV
+  -i, --inventory <path>      Fichier d'inventaire CSV (mode local)
+  --proxmox-host <IP|host>    IP du host Proxmox pour inventaire centralisé
   -t, --telegram              Notification Telegram à la fin
   --no-fail2ban               Désactiver l'installation de fail2ban
   --no-ufw                    Désactiver la configuration UFW
@@ -155,8 +158,8 @@ Options :
   --help                      Afficher cette aide
 
 Exemples :
-  # Hardening complet avec clé SSH
-  ${SCRIPT_NAME} -u sysadmin -k ~/.ssh/id_ed25519.pub -p 2222
+  # Hardening complet avec clé SSH et inventaire centralisé
+  ${SCRIPT_NAME} -u sysadmin -k ~/.ssh/id_ed25519.pub -p 2222 --proxmox-host 192.168.1.1
 
   # Hardening minimal sans firewall
   ${SCRIPT_NAME} -u admin -k https://github.com/monuser.keys --no-ufw
@@ -179,6 +182,7 @@ parse_args() {
             -p|--ssh-port)    SSH_PORT="$2";      shift 2 ;;
             -h|--hostname)    NEW_HOSTNAME="$2";  shift 2 ;;
             -i|--inventory)   INVENTORY_FILE="$2"; shift 2 ;;
+            --proxmox-host)   PROXMOX_HOST="$2";  shift 2 ;;
             -t|--telegram)    ENABLE_TELEGRAM=true; shift ;;
             --no-fail2ban)    ENABLE_FAIL2BAN=false; shift ;;
             --no-ufw)         ENABLE_UFW=false;   shift ;;
@@ -630,18 +634,49 @@ module_register_inventory() {
     date_install="$(date '+%Y-%m-%d %H:%M:%S')"
 
     local entry="${hostname_val},${ip_addr},${SSH_PORT},${ADMIN_USER},${OS_NAME},${CONTAINER_TYPE},${date_install}"
+    local header="hostname,ip,ssh_port,admin_user,os,type,date_hardening"
 
-    if [[ "${DRY_RUN}" == false ]]; then
-        # Créer le header si le fichier n'existe pas
-        if [[ ! -f "${INVENTORY_FILE}" ]]; then
-            echo "hostname,ip,ssh_port,admin_user,os,type,date_hardening" > "${INVENTORY_FILE}"
-        fi
-
-        echo "${entry}" >> "${INVENTORY_FILE}"
-        success "Machine enregistrée dans ${INVENTORY_FILE}"
-    else
+    if [[ "${DRY_RUN}" == true ]]; then
         info "[DRY-RUN] Entrée inventaire : ${entry}"
+        return
     fi
+
+    # Mode centralisé : envoi vers le host Proxmox via SSH
+    if [[ -n "${PROXMOX_HOST}" ]]; then
+        info "Envoi vers le host Proxmox (${PROXMOX_HOST})..."
+
+        # Créer le fichier + header si absent, puis ajouter l'entrée
+        local remote_cmd="
+            if [ ! -f '${PROXMOX_INVENTORY}' ]; then
+                echo '${header}' > '${PROXMOX_INVENTORY}'
+            fi
+            echo '${entry}' >> '${PROXMOX_INVENTORY}'
+        "
+
+        if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+            "root@${PROXMOX_HOST}" "${remote_cmd}" 2>/dev/null; then
+            success "Machine enregistrée sur ${PROXMOX_HOST}:${PROXMOX_INVENTORY}"
+        else
+            warn "Impossible de joindre le host Proxmox (${PROXMOX_HOST})."
+            warn "Enregistrement local de secours dans ${INVENTORY_FILE}"
+            _register_local "${header}" "${entry}"
+        fi
+    else
+        # Mode local (fallback)
+        _register_local "${header}" "${entry}"
+    fi
+}
+
+_register_local() {
+    local header="$1"
+    local entry="$2"
+
+    if [[ ! -f "${INVENTORY_FILE}" ]]; then
+        echo "${header}" > "${INVENTORY_FILE}"
+    fi
+
+    echo "${entry}" >> "${INVENTORY_FILE}"
+    success "Machine enregistrée dans ${INVENTORY_FILE}"
 }
 
 # --- 13. Notification Telegram ---
