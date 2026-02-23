@@ -212,6 +212,7 @@ module_install_essentials() {
         net-tools iputils-ping dnsutils
         ca-certificates gnupg
         sudo
+        openssh-server
         logrotate
         bash-completion
     )
@@ -329,13 +330,18 @@ SSHEOF
     run "chmod 644 '${hardening_conf}'"
     rm -f /tmp/ssh-hardening.conf
 
+    # Créer /run/sshd si absent (nécessaire sur les LXC minimalistes)
+    run "mkdir -p /run/sshd"
+
     # Vérification de la config SSH avant rechargement
     if [[ "${DRY_RUN}" == false ]]; then
-        if sshd -t 2>/dev/null; then
+        local sshd_errors
+        if sshd_errors="$(sshd -t 2>&1)"; then
             run "systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true"
             success "SSH hardened et rechargé (port ${SSH_PORT})."
         else
             error "La configuration SSH est invalide ! Rollback..."
+            error "Détail : ${sshd_errors}"
             rm -f "${hardening_conf}"
             die "Hardening SSH annulé. Vérifiez la configuration manuellement."
         fi
