@@ -456,8 +456,7 @@ cmd_check() {
 # =============================================================================
 
 show_help() {
-    cat << EOF
-
+    printf '%b\n' "
 ${BOLD}${SCRIPT_NAME}${NC} v${SCRIPT_VERSION} — Gestion d'inventaire infrastructure Proxmox
 
 ${BOLD}USAGE${NC}
@@ -479,7 +478,7 @@ ${BOLD}EXEMPLES${NC}
     ${SCRIPT_NAME} search 192.168.1
     ${SCRIPT_NAME} search lxc
     ${SCRIPT_NAME} add
-    ${SCRIPT_NAME} add lxc-nginx-prod 10.0.0.50 2222 sysadmin "Debian 12" lxc
+    ${SCRIPT_NAME} add lxc-nginx-prod 10.0.0.50 2222 sysadmin \"Debian 12\" lxc
     ${SCRIPT_NAME} remove lxc-nginx-prod
     ${SCRIPT_NAME} export --format md
     ${SCRIPT_NAME} stats
@@ -488,8 +487,7 @@ ${BOLD}EXEMPLES${NC}
 ${BOLD}CONFIGURATION${NC}
     INVENTORY_FILE    Chemin du CSV (défaut: /root/inventaire.csv)
     EXPORT_DIR        Dossier d'export (défaut: /root/exports)
-
-EOF
+"
     exit 0
 }
 
