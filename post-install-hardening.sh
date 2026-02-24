@@ -157,6 +157,17 @@ Options :
   --dry-run                   Mode simulation (aucune modification)
   --help                      Afficher cette aide
 
+Modules appliqués :
+  1. Mise à jour système + paquets essentiels
+  2. Création utilisateur admin (sudo, clé SSH)
+  3. Hardening SSH (root off, password off, MaxSessions 2, TCPKeepAlive no)
+  4. Fail2ban (SSH jail)
+  5. UFW (VMs uniquement)
+  6. Mises à jour de sécurité automatiques
+  7. Hardening sysctl (VMs uniquement)
+  8. Hardening avancé Lynis (rkhunter, bannière, login.defs, modprobe, permissions)
+  9. Enregistrement inventaire
+
 Exemples :
   # Hardening complet avec clé SSH et inventaire centralisé
   ${SCRIPT_NAME} -u sysadmin -k ~/.ssh/id_ed25519.pub -p 2222 --proxmox-host 192.168.1.1
@@ -337,13 +348,14 @@ PubkeyAuthentication yes
 AuthenticationMethods publickey
 PermitEmptyPasswords no
 MaxAuthTries 3
-MaxSessions 3
+MaxSessions 2
 
 # Sécurité protocole
 X11Forwarding no
 AllowTcpForwarding no
 AllowAgentForwarding no
 PermitTunnel no
+TCPKeepAlive no
 
 # Timeout et keep-alive
 ClientAliveInterval 300
@@ -657,7 +669,159 @@ LOGEOF
     success "Journald configuré (max 200M, rétention 1 mois)."
 }
 
-# --- 12. Enregistrement dans l'inventaire ---
+# --- 12. Hardening avancé (recommandations Lynis) ---
+module_advanced_hardening() {
+    info "━━━ Hardening avancé (Lynis) ━━━"
+
+    # --- Paquets de sécurité recommandés ---
+    local lynis_packages=(
+        libpam-tmpdir       # Isole $TMP/$TMPDIR par session PAM
+        needrestart         # Détecte les daemons nécessitant un restart
+        debsums             # Vérification d'intégrité des paquets
+        apt-show-versions   # Gestion des versions pour le patching
+        rkhunter            # Scanner de rootkits
+        sysstat             # Collecte de métriques système (sar, iostat)
+        acct                # Process accounting
+    )
+
+    local packages_to_install=()
+    for pkg in "${lynis_packages[@]}"; do
+        if ! dpkg -l "${pkg}" &>/dev/null 2>&1; then
+            packages_to_install+=("${pkg}")
+        fi
+    done
+
+    if [[ "${#packages_to_install[@]}" -gt 0 ]]; then
+        info "Installation des paquets de sécurité : ${packages_to_install[*]}"
+        run "DEBIAN_FRONTEND=noninteractive apt-get install -y ${packages_to_install[*]}"
+    else
+        info "Paquets de sécurité déjà installés."
+    fi
+
+    # Initialiser la base rkhunter si installé
+    if command -v rkhunter &>/dev/null; then
+        run "rkhunter --propupd" 2>/dev/null || true
+    fi
+
+    # Activer sysstat si installé
+    if [[ -f /etc/default/sysstat ]]; then
+        run "sed -i 's/ENABLED=\"false\"/ENABLED=\"true\"/' /etc/default/sysstat"
+        run "systemctl enable --now sysstat" 2>/dev/null || true
+    fi
+
+    # Activer acct si installé
+    if command -v accton &>/dev/null; then
+        run "systemctl enable --now acct" 2>/dev/null || true
+    fi
+
+    success "Paquets de sécurité installés et configurés."
+
+    # --- Bannière légale ---
+    local banner_text="ATTENTION : Acces reserve aux utilisateurs autorises. Toute activite est surveillee et enregistree."
+    local banner_file="/etc/issue"
+    local banner_net="/etc/issue.net"
+
+    if ! grep -qF "utilisateurs autorises" "${banner_file}" 2>/dev/null; then
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Écriture bannière légale dans /etc/issue et /etc/issue.net"
+        else
+            echo "${banner_text}" | tee "${banner_file}" "${banner_net}" > /dev/null
+        fi
+        success "Bannière légale configurée (/etc/issue et /etc/issue.net)."
+    else
+        info "Bannière légale déjà en place."
+    fi
+
+    # --- Politique de mots de passe (login.defs) ---
+    local login_defs="/etc/login.defs"
+    if [[ -f "${login_defs}" ]]; then
+        # Umask restrictif (022 → 027)
+        if grep -q "^UMASK" "${login_defs}"; then
+            run "sed -i 's/^UMASK.*/UMASK\t\t027/' '${login_defs}'"
+        else
+            run "echo 'UMASK		027' >> '${login_defs}'"
+        fi
+
+        # Durée min/max des mots de passe
+        if grep -q "^PASS_MIN_DAYS" "${login_defs}"; then
+            run "sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t1/' '${login_defs}'"
+        else
+            run "echo 'PASS_MIN_DAYS	1' >> '${login_defs}'"
+        fi
+
+        if grep -q "^PASS_MAX_DAYS" "${login_defs}"; then
+            run "sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t365/' '${login_defs}'"
+        else
+            run "echo 'PASS_MAX_DAYS	365' >> '${login_defs}'"
+        fi
+
+        # Rounds de hachage SHA
+        if grep -q "^SHA_ROUNDS" "${login_defs}"; then
+            run "sed -i 's/^SHA_ROUNDS.*/SHA_ROUNDS\t\t5000/' '${login_defs}'"
+        else
+            run "echo 'SHA_ROUNDS		5000' >> '${login_defs}'"
+        fi
+
+        success "Politique de mots de passe renforcée (login.defs)."
+    fi
+
+    # --- Désactivation des protocoles réseau inutiles ---
+    local modprobe_conf="/etc/modprobe.d/hardening.conf"
+    if [[ ! -f "${modprobe_conf}" ]]; then
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Création ${modprobe_conf} (protocoles réseau + USB/FireWire)"
+        else
+            cat > "${modprobe_conf}" << 'MODEOF'
+# Protocoles réseau inutiles — désactivés par post-install-hardening.sh
+install dccp /bin/true
+install sctp /bin/true
+install rds /bin/true
+install tipc /bin/true
+# Stockage externe
+install usb-storage /bin/true
+install firewire-core /bin/true
+MODEOF
+        fi
+        success "Protocoles réseau et stockage USB/FireWire désactivés."
+    else
+        info "Hardening modprobe déjà en place."
+    fi
+
+    # --- Permissions restrictives sur les fichiers sensibles ---
+    local sensitive_files=(
+        "/etc/crontab:600"
+        "/etc/ssh/sshd_config:600"
+        "/etc/shadow:640"
+    )
+
+    for entry in "${sensitive_files[@]}"; do
+        local filepath="${entry%%:*}"
+        local perms="${entry##*:}"
+        if [[ -f "${filepath}" ]]; then
+            local current_perms
+            current_perms=$(stat -c "%a" "${filepath}" 2>/dev/null || echo "")
+            if [[ "${current_perms}" != "${perms}" ]]; then
+                run "chmod ${perms} '${filepath}'"
+            fi
+        fi
+    done
+
+    # Restreindre l'accès aux compilateurs si présents
+    for compiler in /usr/bin/gcc /usr/bin/g++ /usr/bin/cc; do
+        if [[ -f "${compiler}" && ! -L "${compiler}" ]]; then
+            local current_perms
+            current_perms=$(stat -c "%a" "${compiler}" 2>/dev/null || echo "")
+            if [[ "${current_perms}" != "700" ]]; then
+                run "chmod 700 '${compiler}'"
+            fi
+        fi
+    done
+
+    success "Permissions restrictives appliquées."
+    success "Hardening avancé terminé."
+}
+
+# --- 13. Enregistrement dans l'inventaire ---
 module_register_inventory() {
     info "━━━ Enregistrement dans l'inventaire ━━━"
 
@@ -796,6 +960,7 @@ print_summary() {
     echo -e "${GREEN}║${NC} UFW           : ${ufw_status}"
     echo -e "${GREEN}║${NC} Sysctl        : ${sysctl_status}"
     echo -e "${GREEN}║${NC} Auto-updates  : ${ENABLE_UNATTENDED}"
+    echo -e "${GREEN}║${NC} Lynis harden  : true (rkhunter, bannière, modprobe, login.defs)"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC} Connexion     : ssh -p ${SSH_PORT} ${ADMIN_USER}@${ip_addr}"
     echo -e "${GREEN}║${NC} Log           : ${LOG_FILE}"
@@ -834,6 +999,7 @@ main() {
     module_harden_sysctl
     module_disable_unnecessary_services
     module_configure_logging
+    module_advanced_hardening
     module_register_inventory
     module_notify_telegram
 
