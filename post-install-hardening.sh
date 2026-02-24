@@ -680,11 +680,15 @@ module_advanced_hardening() {
         needrestart         # Détecte les daemons nécessitant un restart (DEB-0831)
         debsums             # Vérification d'intégrité des paquets (PKGS-7370)
         apt-show-versions   # Gestion des versions pour le patching (PKGS-7394)
-        apt-listbugs        # Affiche les bugs critiques avant install (DEB-0810)
         rkhunter            # Scanner de rootkits (HRDN-7230)
         aide                # Surveillance d'intégrité des fichiers (FINT-4350)
         sysstat             # Collecte de métriques système (ACCT-9626)
     )
+
+    # apt-listbugs n'existe que sur Debian
+    if [[ "${OS_ID}" == "debian" ]]; then
+        lynis_packages+=("apt-listbugs")
+    fi
 
     # acct et auditd nécessitent un accès kernel — skip en LXC
     if [[ "${CONTAINER_TYPE}" != "lxc" ]]; then
@@ -694,7 +698,12 @@ module_advanced_hardening() {
     local packages_to_install=()
     for pkg in "${lynis_packages[@]}"; do
         if ! dpkg -l "${pkg}" 2>/dev/null | grep -q "^ii"; then
-            packages_to_install+=("${pkg}")
+            # Vérifier que le paquet est disponible dans les repos
+            if apt-cache show "${pkg}" &>/dev/null; then
+                packages_to_install+=("${pkg}")
+            else
+                info "Paquet ${pkg} non disponible dans les repos — ignoré."
+            fi
         fi
     done
 
