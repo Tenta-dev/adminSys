@@ -644,7 +644,7 @@ audit_certificates() {
     fi
 
     # Vérifier les certificats dans /etc/ssl personnalisés
-    for cert in /etc/ssl/certs/local-*.pem /etc/ssl/private/*.crt 2>/dev/null; do
+    for cert in /etc/ssl/certs/local-*.pem /etc/ssl/private/*.crt; do
         [[ -f "${cert}" ]] || continue
         cert_found=true
 
