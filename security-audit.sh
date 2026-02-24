@@ -515,6 +515,11 @@ audit_docker() {
         return
     fi
 
+    # Version Docker
+    local docker_version
+    docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "inconnue")
+    result_info "Docker version ${docker_version}"
+
     # Conteneurs en cours
     local running
     running=$(docker ps -q 2>/dev/null | wc -l || echo "0")
@@ -532,6 +537,116 @@ audit_docker() {
         docker ps --filter "status=restarting" --format "    {{.Names}} ({{.Image}})" 2>/dev/null
     fi
 
+    # --- Sécurité des conteneurs en cours ---
+    if [[ "${running}" -gt 0 ]]; then
+
+        # Conteneurs en mode privileged
+        local priv_count=0
+        while read -r cid; do
+            local cname cpriv
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            cpriv=$(docker inspect "${cid}" --format '{{.HostConfig.Privileged}}' 2>/dev/null)
+            if [[ "${cpriv}" == "true" ]]; then
+                if [[ "${priv_count}" -eq 0 ]]; then
+                    result_crit "Conteneur(s) en mode --privileged (accès total au host) :"
+                fi
+                echo -e "    ${RED}${cname}${NC}"
+                priv_count=$((priv_count + 1))
+            fi
+        done < <(docker ps -q 2>/dev/null)
+        if [[ "${priv_count}" -eq 0 ]]; then
+            result_ok "Aucun conteneur en mode privileged"
+        fi
+
+        # Conteneurs en mode --net=host
+        local nethost_count=0
+        while read -r cid; do
+            local cname cnet
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            cnet=$(docker inspect "${cid}" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
+            if [[ "${cnet}" == "host" ]]; then
+                if [[ "${nethost_count}" -eq 0 ]]; then
+                    result_warn "Conteneur(s) en mode --net=host (pas d'isolation réseau) :"
+                fi
+                echo -e "    ${YELLOW}${cname}${NC}"
+                nethost_count=$((nethost_count + 1))
+            fi
+        done < <(docker ps -q 2>/dev/null)
+
+        # Conteneurs exécutant en tant que root
+        local root_count=0
+        local non_root_count=0
+        while read -r cid; do
+            local cname cuser
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            cuser=$(docker inspect "${cid}" --format '{{.Config.User}}' 2>/dev/null)
+            if [[ -z "${cuser}" || "${cuser}" == "root" || "${cuser}" == "0" ]]; then
+                root_count=$((root_count + 1))
+            else
+                non_root_count=$((non_root_count + 1))
+            fi
+        done < <(docker ps -q 2>/dev/null)
+        if [[ "${root_count}" -gt 0 ]]; then
+            result_warn "${root_count} conteneur(s) exécuté(s) en tant que root"
+        fi
+        if [[ "${non_root_count}" -gt 0 ]]; then
+            result_ok "${non_root_count} conteneur(s) exécuté(s) avec un utilisateur non-root"
+        fi
+
+        # Conteneurs avec des ports bindés sur 0.0.0.0 (exposés sur toutes les interfaces)
+        local exposed_count=0
+        while read -r cid; do
+            local cname ports_all
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            ports_all=$(docker port "${cid}" 2>/dev/null | grep "0.0.0.0:" || true)
+            if [[ -n "${ports_all}" ]]; then
+                if [[ "${exposed_count}" -eq 0 ]]; then
+                    result_warn "Conteneur(s) avec des ports exposés sur toutes les interfaces (0.0.0.0) :"
+                fi
+                echo -e "    ${YELLOW}${cname}${NC} — $(echo "${ports_all}" | awk '{print $3}' | tr '\n' ' ')"
+                exposed_count=$((exposed_count + 1))
+            fi
+        done < <(docker ps -q 2>/dev/null)
+        if [[ "${exposed_count}" -eq 0 && "${running}" -gt 0 ]]; then
+            result_ok "Aucun port exposé sur 0.0.0.0"
+        fi
+
+        # Conteneurs sans restart policy
+        local norestart_count=0
+        while read -r cid; do
+            local cname cpolicy
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            cpolicy=$(docker inspect "${cid}" --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null)
+            if [[ "${cpolicy}" == "no" || -z "${cpolicy}" ]]; then
+                norestart_count=$((norestart_count + 1))
+            fi
+        done < <(docker ps -q 2>/dev/null)
+        if [[ "${norestart_count}" -gt 0 ]]; then
+            result_info "${norestart_count} conteneur(s) sans politique de redémarrage"
+        fi
+
+        # Conteneurs avec le socket Docker monté (risque d'évasion)
+        local socket_count=0
+        while read -r cid; do
+            local cname cmounts
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            cmounts=$(docker inspect "${cid}" --format '{{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null)
+            if echo "${cmounts}" | grep -q "docker.sock"; then
+                if [[ "${socket_count}" -eq 0 ]]; then
+                    result_crit "Conteneur(s) avec le socket Docker monté (risque d'évasion) :"
+                fi
+                echo -e "    ${RED}${cname}${NC}"
+                socket_count=$((socket_count + 1))
+            fi
+        done < <(docker ps -q 2>/dev/null)
+        if [[ "${socket_count}" -eq 0 ]]; then
+            result_ok "Aucun conteneur avec le socket Docker monté"
+        fi
+
+    fi
+
+    # --- Hygiène Docker ---
+
     # Images sans tag (dangling)
     local dangling
     dangling=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l || echo "0")
@@ -548,17 +663,17 @@ audit_docker() {
         result_warn "${orphan_volumes} volume(s) orphelin(s) — récupérable avec 'docker volume prune'"
     fi
 
-    # Conteneurs avec --privileged ou --net=host
-    local privileged
-    privileged=$(docker ps --format '{{.ID}}' 2>/dev/null | while read -r cid; do
-        docker inspect "${cid}" --format '{{.Name}} {{.HostConfig.Privileged}}' 2>/dev/null | grep "true"
-    done || true)
-    if [[ -n "${privileged}" ]]; then
-        result_warn "Conteneur(s) en mode privilégié :"
-        echo "${privileged}" | while IFS= read -r line; do
-            echo -e "    ${YELLOW}${line}${NC}"
-        done
+    # Docker API exposée sur le réseau
+    if ss -tlnp 2>/dev/null | grep -q ":2375 \|:2376 "; then
+        result_crit "API Docker exposée sur le réseau (port 2375/2376) — risque majeur"
+    else
+        result_ok "API Docker non exposée sur le réseau"
     fi
+
+    # Espace disque Docker
+    local docker_disk
+    docker_disk=$(docker system df --format '{{.Size}}' 2>/dev/null | head -1 || echo "N/A")
+    result_info "Espace Docker utilisé : images=${docker_disk:-N/A}"
 }
 
 # --- 10. Lynis (si installé) ---
