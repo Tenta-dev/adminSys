@@ -892,6 +892,38 @@ MODEOF
     done
 
     success "Permissions restrictives appliquées."
+
+    # --- Profil Lynis custom pour LXC (faux positifs) ---
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        local lynis_prf="/etc/lynis/custom.prf"
+        run "mkdir -p /etc/lynis"
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Création profil Lynis LXC"
+        else
+            # Créer/mettre à jour le profil custom
+            cat > "${lynis_prf}" << 'LYNISEOF'
+# Profil Lynis custom — faux positifs LXC
+# Généré par post-install-hardening.sh
+
+# iptables chargé par le host mais pas de règles dans le conteneur (normal)
+skip-test=FIRE-4512
+
+# Pas de kernel propre en LXC
+skip-test=KRNL-5788
+
+# sysctl géré par le host
+skip-test=KRNL-6000
+
+# Pas de boot propre en LXC
+skip-test=BOOT-5180
+
+# Partitions séparées non pertinentes en LXC
+skip-test=FILE-6310
+LYNISEOF
+            success "Profil Lynis LXC configuré (faux positifs ignorés)."
+        fi
+    fi
+
     success "Hardening avancé terminé."
 }
 
