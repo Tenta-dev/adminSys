@@ -682,13 +682,13 @@ module_advanced_hardening() {
         apt-show-versions   # Gestion des versions pour le patching (PKGS-7394)
         apt-listbugs        # Affiche les bugs critiques avant install (DEB-0810)
         rkhunter            # Scanner de rootkits (HRDN-7230)
+        aide                # Surveillance d'intégrité des fichiers (FINT-4350)
         sysstat             # Collecte de métriques système (ACCT-9626)
-        auditd              # Audit système (ACCT-9628)
     )
 
-    # acct (process accounting) ne fonctionne pas en LXC — skip
+    # acct et auditd nécessitent un accès kernel — skip en LXC
     if [[ "${CONTAINER_TYPE}" != "lxc" ]]; then
-        lynis_packages+=("acct")
+        lynis_packages+=("acct" "auditd")
     fi
 
     local packages_to_install=()
@@ -710,6 +710,14 @@ module_advanced_hardening() {
         run "rkhunter --propupd" 2>/dev/null || true
     fi
 
+    # Initialiser la base AIDE si installé (peut être long)
+    if command -v aide &>/dev/null; then
+        if [[ ! -f /var/lib/aide/aide.db ]]; then
+            info "Initialisation de la base AIDE (peut prendre quelques minutes)..."
+            run "aideinit" 2>/dev/null || true
+        fi
+    fi
+
     # Activer sysstat si installé
     if [[ -f /etc/default/sysstat ]]; then
         run "sed -i 's/ENABLED=\"false\"/ENABLED=\"true\"/' /etc/default/sysstat"
@@ -721,29 +729,43 @@ module_advanced_hardening() {
         run "systemctl enable --now acct" 2>/dev/null || true
     fi
 
-    # Nettoyer acct si installé en échec sur un LXC (run précédent sans ce fix)
+    # Nettoyer acct/auditd si installés en échec sur un LXC (run précédent sans ce fix)
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
-        if systemctl is-failed acct &>/dev/null 2>&1; then
-            run "systemctl disable acct" 2>/dev/null || true
-            run "systemctl reset-failed acct" 2>/dev/null || true
-            info "Service acct désactivé (non supporté en LXC)."
-        fi
+        for svc in acct auditd audit-rules; do
+            if systemctl is-failed "${svc}" &>/dev/null 2>&1; then
+                run "systemctl disable ${svc}" 2>/dev/null || true
+                run "systemctl reset-failed ${svc}" 2>/dev/null || true
+                info "Service ${svc} désactivé (non supporté en LXC)."
+            fi
+        done
     fi
 
-    # Activer auditd si installé
-    if command -v auditd &>/dev/null; then
+    # Activer auditd si installé ET pas en LXC
+    if [[ "${CONTAINER_TYPE}" != "lxc" ]] && command -v auditd &>/dev/null; then
         run "systemctl enable --now auditd" 2>/dev/null || true
+    fi
+
+    # Configurer debsums pour vérification régulière via cron (PKGS-7370)
+    if [[ -f /etc/default/debsums ]]; then
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Activation CRON_CHECK dans /etc/default/debsums"
+        else
+            sed -i 's/^CRON_CHECK=.*/CRON_CHECK=weekly/' /etc/default/debsums 2>/dev/null || true
+            # Si la variable n'existe pas, l'ajouter
+            grep -q "^CRON_CHECK" /etc/default/debsums 2>/dev/null || echo "CRON_CHECK=weekly" >> /etc/default/debsums
+        fi
     fi
 
     success "Paquets de sécurité installés et configurés."
 
     # --- Bannière légale (BANN-7126 / BANN-7130) ---
-    # Lynis vérifie que /etc/issue et /etc/issue.net ne contiennent pas le texte par défaut
-    # On écrase complètement le fichier à chaque run pour être sûr
+    # Lynis cherche des mots-clés anglais : authorized, unauthorized, prohibited, monitored
     local banner_text="###############################################################
-#               ACCES RESERVE AUX UTILISATEURS AUTORISES        #
-#  Toute activite est surveillee et enregistree.                #
-#  Les contrevenants seront poursuivis.                         #
+#  Unauthorized access to this system is prohibited.          #
+#  All activity may be monitored and reported.                #
+#                                                             #
+#  Acces reserve aux utilisateurs autorises.                  #
+#  Toute activite est susceptible d'etre surveillee.          #
 ###############################################################"
 
     if [[ "${DRY_RUN}" == true ]]; then
@@ -775,7 +797,8 @@ module_advanced_hardening() {
             _set_login_defs "UMASK" "027"
             _set_login_defs "PASS_MIN_DAYS" "1"
             _set_login_defs "PASS_MAX_DAYS" "365"
-            _set_login_defs "SHA_ROUNDS" "5000"
+            _set_login_defs "SHA_CRYPT_MIN_ROUNDS" "5000"
+            _set_login_defs "SHA_CRYPT_MAX_ROUNDS" "5000"
         fi
 
         success "Politique de mots de passe renforcée (login.defs)."
