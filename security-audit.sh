@@ -321,13 +321,24 @@ audit_open_ports() {
     print_section "Ports ouverts"
 
     local port_count=0
+    local seen_ports=""
 
-    # Lister les ports en écoute
+    # ss -tulnp format: proto state recv-q send-q local_addr:port peer_addr:port process
     while IFS= read -r line; do
-        local proto port process
+        local proto port process addr
         proto=$(echo "${line}" | awk '{print $1}')
-        port=$(echo "${line}" | awk '{print $4}' | rev | cut -d: -f1 | rev)
-        process=$(echo "${line}" | awk '{print $NF}')
+        addr=$(echo "${line}" | awk '{print $5}')
+        port=$(echo "${addr}" | rev | cut -d: -f1 | rev)
+        # Extraire le nom du process : users:(("sshd",pid=123,fd=4)) → sshd
+        process=$(echo "${line}" | grep -oP '"\K[^"]+' | head -1)
+        [[ -z "${process}" ]] && process="unknown"
+
+        # Dédupliquer (même port+proto vu en IPv4 et IPv6)
+        local key="${proto}/${port}/${process}"
+        if echo "${seen_ports}" | grep -qF "${key}"; then
+            continue
+        fi
+        seen_ports="${seen_ports} ${key}"
 
         # Classifier le port
         case "${port}" in
@@ -345,7 +356,7 @@ audit_open_ports() {
                 ;;
         esac
         port_count=$((port_count + 1))
-    done < <(ss -tulnp 2>/dev/null | grep "LISTEN" | sort -t: -k2 -n || true)
+    done < <(ss -tulnp 2>/dev/null | grep "LISTEN" || true)
 
     if [[ "${port_count}" -eq 0 ]]; then
         result_info "Aucun port en écoute détecté"
@@ -476,8 +487,11 @@ audit_failed_services() {
     if [[ "${failed_count}" -gt 0 ]]; then
         result_crit "${failed_count} service(s) en échec"
         echo "${failed}" | while IFS= read -r line; do
+            # systemctl --failed: "● service.name loaded failed failed Description"
             local svc
-            svc=$(echo "${line}" | awk '{print $1}')
+            svc=$(echo "${line}" | awk '{print $2}')
+            # Fallback si $2 est vide (format alternatif)
+            [[ -z "${svc}" ]] && svc=$(echo "${line}" | awk '{print $1}')
             echo -e "    ${RED}${svc}${NC}"
         done
     else
