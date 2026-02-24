@@ -74,7 +74,7 @@ ensure_inventory() {
 
 count_machines() {
     local count
-    count=$(tail -n +2 "${INVENTORY_FILE}" 2>/dev/null | grep -c '[^[:space:]]' || echo "0")
+    count=$(tail -n +2 "${INVENTORY_FILE}" 2>/dev/null | grep -c '[^[:space:]]' || true)
     echo "${count}"
 }
 
@@ -135,7 +135,7 @@ print_table() {
 
     print_separator
     local total
-    total=$(echo "${data}" | grep -c '[^[:space:]]' || echo "0")
+    total=$(echo "${data}" | grep -c '[^[:space:]]' || true)
     echo -e "${DIM}${total} machine(s)${NC}"
     echo ""
 }
@@ -339,8 +339,8 @@ MDEOF
 _stats_for_markdown() {
     local total lxc_count vm_count
     total=$(count_machines)
-    lxc_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',lxc,' || echo "0")
-    vm_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',kvm\|,qemu' || echo "0")
+    lxc_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',lxc,' || true)
+    vm_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',kvm\|,qemu' || true)
     local other_count=$((total - lxc_count - vm_count))
 
     echo "- **Total** : ${total} machine(s)"
@@ -371,8 +371,8 @@ cmd_stats() {
 
     local total lxc_count vm_count
     total=$(count_machines)
-    lxc_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',lxc,' || echo "0")
-    vm_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',kvm\|,qemu' || echo "0")
+    lxc_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',lxc,' || true)
+    vm_count=$(tail -n +2 "${INVENTORY_FILE}" | grep -c ',kvm\|,qemu' || true)
     local other_count=$((total - lxc_count - vm_count))
 
     echo ""
