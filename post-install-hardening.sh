@@ -712,6 +712,24 @@ module_advanced_hardening() {
 
     # Initialiser la base AIDE si installé (en arrière-plan, peut être long)
     if command -v aide &>/dev/null; then
+        # Exclusions LXC et stockage média (réduit le bruit et le temps de scan)
+        local aide_excl="/etc/aide/aide.conf.d/00_aide_local_exclusions"
+        if [[ ! -f "${aide_excl}" ]]; then
+            if [[ "${DRY_RUN}" == true ]]; then
+                info "[DRY-RUN] Création exclusions AIDE"
+            else
+                cat > "${aide_excl}" << 'AIDEEOF'
+# Exclusions locales — générées par post-install-hardening.sh
+# Répertoires host non accessibles en LXC
+!/dev/.lxc
+!/lost+found
+# Stockage média/données volumineux (pas pertinent pour l'intégrité système)
+!/mnt/data01
+!/mnt/data02
+AIDEEOF
+            fi
+        fi
+
         if [[ ! -f /var/lib/aide/aide.db ]]; then
             info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
             if [[ "${DRY_RUN}" == false ]]; then
