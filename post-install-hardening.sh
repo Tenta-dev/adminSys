@@ -260,22 +260,57 @@ module_create_admin_user() {
     # Déploiement de la clé SSH
     if [[ -n "${SSH_KEY}" ]]; then
         local ssh_dir="/home/${ADMIN_USER}/.ssh"
+        local auth_keys="${ssh_dir}/authorized_keys"
+        local tmp_keys
+        tmp_keys=$(mktemp)
+
         run "mkdir -p '${ssh_dir}'"
 
+        # Récupérer les clés depuis la source
         if [[ "${SSH_KEY}" =~ ^https?:// ]]; then
             info "Téléchargement de la clé SSH depuis ${SSH_KEY}..."
-            run "curl -fsSL '${SSH_KEY}' >> '${ssh_dir}/authorized_keys'"
+            if ! curl -fsSL "${SSH_KEY}" > "${tmp_keys}" 2>/dev/null; then
+                warn "Impossible de télécharger la clé depuis ${SSH_KEY}. Étape ignorée."
+                rm -f "${tmp_keys}"
+                return
+            fi
         elif [[ -f "${SSH_KEY}" ]]; then
-            run "cat '${SSH_KEY}' >> '${ssh_dir}/authorized_keys'"
+            cp "${SSH_KEY}" "${tmp_keys}"
         else
             warn "Clé SSH introuvable : ${SSH_KEY}. Étape ignorée."
+            rm -f "${tmp_keys}"
             return
         fi
 
+        # Créer le fichier authorized_keys s'il n'existe pas
+        [[ -f "${auth_keys}" ]] || touch "${auth_keys}"
+
+        # Ajouter uniquement les clés absentes (dédoublonnage)
+        local added=0
+        local skipped=0
+        while IFS= read -r key; do
+            # Ignorer les lignes vides et commentaires
+            [[ -z "${key}" || "${key}" =~ ^# ]] && continue
+
+            if grep -qF "${key}" "${auth_keys}" 2>/dev/null; then
+                skipped=$((skipped + 1))
+            else
+                echo "${key}" >> "${auth_keys}"
+                added=$((added + 1))
+            fi
+        done < "${tmp_keys}"
+
+        rm -f "${tmp_keys}"
+
         run "chmod 700 '${ssh_dir}'"
-        run "chmod 600 '${ssh_dir}/authorized_keys'"
+        run "chmod 600 '${auth_keys}'"
         run "chown -R '${ADMIN_USER}:${ADMIN_USER}' '${ssh_dir}'"
-        success "Clé SSH déployée pour ${ADMIN_USER}."
+
+        if [[ "${added}" -gt 0 ]]; then
+            success "Clé(s) SSH déployée(s) pour ${ADMIN_USER} (${added} ajoutée(s), ${skipped} déjà présente(s))."
+        else
+            info "Toutes les clés SSH sont déjà présentes pour ${ADMIN_USER} (${skipped} existante(s))."
+        fi
     else
         warn "Aucune clé SSH fournie (-k). L'accès SSH par clé devra être configuré manuellement."
     fi
