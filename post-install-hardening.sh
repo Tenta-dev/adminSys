@@ -71,7 +71,7 @@ log() {
     local message="$*"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo -e "${timestamp} [${level}] ${message}" | tee -a "${LOG_FILE}" 2>/dev/null || true
+    echo "${timestamp} [${level}] ${message}" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
 info()    { echo -e "${BLUE}[INFO]${NC}    $*"; log "INFO" "$*"; }
@@ -775,6 +775,14 @@ print_summary() {
     local ip_addr
     ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')" || ip_addr="N/A"
 
+    # État réel (prend en compte les skips LXC)
+    local ufw_status="${ENABLE_UFW}"
+    local sysctl_status="true"
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        ufw_status="ignoré (LXC)"
+        sysctl_status="ignoré (LXC)"
+    fi
+
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║              HARDENING TERMINÉ AVEC SUCCÈS                  ║${NC}"
@@ -785,7 +793,8 @@ print_summary() {
     echo -e "${GREEN}║${NC} Utilisateur   : ${ADMIN_USER}"
     echo -e "${GREEN}║${NC} Port SSH      : ${SSH_PORT}"
     echo -e "${GREEN}║${NC} Fail2ban      : ${ENABLE_FAIL2BAN}"
-    echo -e "${GREEN}║${NC} UFW           : ${ENABLE_UFW}"
+    echo -e "${GREEN}║${NC} UFW           : ${ufw_status}"
+    echo -e "${GREEN}║${NC} Sysctl        : ${sysctl_status}"
     echo -e "${GREEN}║${NC} Auto-updates  : ${ENABLE_UNATTENDED}"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC} Connexion     : ssh -p ${SSH_PORT} ${ADMIN_USER}@${ip_addr}"
