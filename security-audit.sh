@@ -412,7 +412,7 @@ audit_users() {
 
     # Fichiers SUID suspects
     local suid_files
-    suid_files=$(find / -perm -4000 -type f 2>/dev/null | grep -v -E "^/(usr/(bin|lib|libexec|sbin)|bin|sbin|var/lib/(docker|containerd))/" || true)
+    suid_files=$(find / -perm -4000 -type f 2>/dev/null | grep -v -E "^/(usr/(bin|lib|libexec|sbin)|bin|sbin|opt|var/lib/(docker|containerd))/" || true)
     local suid_count
     suid_count=$(echo "${suid_files}" | grep -c '[^[:space:]]' || true)
     if [[ "${suid_count}" -gt 0 ]]; then
