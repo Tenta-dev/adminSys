@@ -731,10 +731,15 @@ AIDEEOF
         fi
 
         if [[ ! -f /var/lib/aide/aide.db ]]; then
-            info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
-            if [[ "${DRY_RUN}" == false ]]; then
-                nohup aideinit > /var/log/aide-init.log 2>&1 &
-                info "AIDE PID: $! — Progression dans /var/log/aide-init.log"
+            # Vérifier qu'une init n'est pas déjà en cours
+            if pgrep -f "aideinit|aide.*--config" &>/dev/null; then
+                info "AIDE est déjà en cours d'initialisation (PID: $(pgrep -f 'aideinit|aide.*--config' | head -1))."
+            else
+                info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
+                if [[ "${DRY_RUN}" == false ]]; then
+                    nohup aideinit > /var/log/aide-init.log 2>&1 &
+                    info "AIDE PID: $! — Progression dans /var/log/aide-init.log"
+                fi
             fi
         fi
     fi
