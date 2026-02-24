@@ -710,11 +710,14 @@ module_advanced_hardening() {
         run "rkhunter --propupd" 2>/dev/null || true
     fi
 
-    # Initialiser la base AIDE si installé (peut être long)
+    # Initialiser la base AIDE si installé (en arrière-plan, peut être long)
     if command -v aide &>/dev/null; then
         if [[ ! -f /var/lib/aide/aide.db ]]; then
-            info "Initialisation de la base AIDE (peut prendre quelques minutes)..."
-            run "aideinit" 2>/dev/null || true
+            info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
+            if [[ "${DRY_RUN}" == false ]]; then
+                nohup aideinit > /var/log/aide-init.log 2>&1 &
+                info "AIDE PID: $! — Progression dans /var/log/aide-init.log"
+            fi
         fi
     fi
 
