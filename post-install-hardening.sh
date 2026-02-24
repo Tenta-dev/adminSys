@@ -680,12 +680,16 @@ module_register_inventory() {
     if [[ -n "${PROXMOX_HOST}" ]]; then
         info "Envoi vers le host Proxmox (${PROXMOX_HOST})..."
 
-        # Créer le fichier + header si absent, puis ajouter l'entrée
+        # Créer le fichier si absent, supprimer l'ancienne entrée (même hostname ou IP), ajouter la nouvelle
         local remote_cmd="
             if [ ! -f '${PROXMOX_INVENTORY}' ]; then
                 echo '${header}' > '${PROXMOX_INVENTORY}'
             fi
-            echo '${entry}' >> '${PROXMOX_INVENTORY}'
+            tmp=\$(mktemp)
+            head -1 '${PROXMOX_INVENTORY}' > \"\${tmp}\"
+            tail -n +2 '${PROXMOX_INVENTORY}' | grep -v '^${hostname_val},\|,${ip_addr},' >> \"\${tmp}\" || true
+            echo '${entry}' >> \"\${tmp}\"
+            mv \"\${tmp}\" '${PROXMOX_INVENTORY}'
         "
 
         if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
@@ -694,23 +698,32 @@ module_register_inventory() {
         else
             warn "Impossible de joindre le host Proxmox (${PROXMOX_HOST})."
             warn "Enregistrement local de secours dans ${INVENTORY_FILE}"
-            _register_local "${header}" "${entry}"
+            _register_local "${header}" "${entry}" "${hostname_val}" "${ip_addr}"
         fi
     else
         # Mode local (fallback)
-        _register_local "${header}" "${entry}"
+        _register_local "${header}" "${entry}" "${hostname_val}" "${ip_addr}"
     fi
 }
 
 _register_local() {
     local header="$1"
     local entry="$2"
+    local hostname_val="$3"
+    local ip_addr="$4"
 
     if [[ ! -f "${INVENTORY_FILE}" ]]; then
         echo "${header}" > "${INVENTORY_FILE}"
     fi
 
-    echo "${entry}" >> "${INVENTORY_FILE}"
+    # Supprimer l'ancienne entrée si même hostname ou IP
+    local tmp
+    tmp=$(mktemp)
+    head -1 "${INVENTORY_FILE}" > "${tmp}"
+    tail -n +2 "${INVENTORY_FILE}" | grep -v "^${hostname_val},\|,${ip_addr}," >> "${tmp}" || true
+    echo "${entry}" >> "${tmp}"
+    mv "${tmp}" "${INVENTORY_FILE}"
+
     success "Machine enregistrée dans ${INVENTORY_FILE}"
 }
 
