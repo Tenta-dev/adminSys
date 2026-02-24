@@ -676,17 +676,24 @@ module_advanced_hardening() {
     # --- Paquets de sécurité recommandés ---
     local lynis_packages=(
         libpam-tmpdir       # Isole $TMP/$TMPDIR par session PAM
-        needrestart         # Détecte les daemons nécessitant un restart
-        debsums             # Vérification d'intégrité des paquets
-        apt-show-versions   # Gestion des versions pour le patching
-        rkhunter            # Scanner de rootkits
-        sysstat             # Collecte de métriques système (sar, iostat)
-        acct                # Process accounting
+        libpam-passwdqc     # Politique de force des mots de passe (AUTH-9262)
+        needrestart         # Détecte les daemons nécessitant un restart (DEB-0831)
+        debsums             # Vérification d'intégrité des paquets (PKGS-7370)
+        apt-show-versions   # Gestion des versions pour le patching (PKGS-7394)
+        apt-listbugs        # Affiche les bugs critiques avant install (DEB-0810)
+        rkhunter            # Scanner de rootkits (HRDN-7230)
+        sysstat             # Collecte de métriques système (ACCT-9626)
+        auditd              # Audit système (ACCT-9628)
     )
+
+    # acct (process accounting) ne fonctionne pas en LXC — skip
+    if [[ "${CONTAINER_TYPE}" != "lxc" ]]; then
+        lynis_packages+=("acct")
+    fi
 
     local packages_to_install=()
     for pkg in "${lynis_packages[@]}"; do
-        if ! dpkg -l "${pkg}" &>/dev/null 2>&1; then
+        if ! dpkg -l "${pkg}" 2>/dev/null | grep -q "^ii"; then
             packages_to_install+=("${pkg}")
         fi
     done
@@ -709,57 +716,66 @@ module_advanced_hardening() {
         run "systemctl enable --now sysstat" 2>/dev/null || true
     fi
 
-    # Activer acct si installé
-    if command -v accton &>/dev/null; then
+    # Activer acct si installé ET pas en LXC
+    if [[ "${CONTAINER_TYPE}" != "lxc" ]] && command -v accton &>/dev/null; then
         run "systemctl enable --now acct" 2>/dev/null || true
+    fi
+
+    # Nettoyer acct si installé en échec sur un LXC (run précédent sans ce fix)
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        if systemctl is-failed acct &>/dev/null 2>&1; then
+            run "systemctl disable acct" 2>/dev/null || true
+            run "systemctl reset-failed acct" 2>/dev/null || true
+            info "Service acct désactivé (non supporté en LXC)."
+        fi
+    fi
+
+    # Activer auditd si installé
+    if command -v auditd &>/dev/null; then
+        run "systemctl enable --now auditd" 2>/dev/null || true
     fi
 
     success "Paquets de sécurité installés et configurés."
 
-    # --- Bannière légale ---
-    local banner_text="ATTENTION : Acces reserve aux utilisateurs autorises. Toute activite est surveillee et enregistree."
-    local banner_file="/etc/issue"
-    local banner_net="/etc/issue.net"
+    # --- Bannière légale (BANN-7126 / BANN-7130) ---
+    # Lynis vérifie que /etc/issue et /etc/issue.net ne contiennent pas le texte par défaut
+    # On écrase complètement le fichier à chaque run pour être sûr
+    local banner_text="###############################################################
+#               ACCES RESERVE AUX UTILISATEURS AUTORISES        #
+#  Toute activite est surveillee et enregistree.                #
+#  Les contrevenants seront poursuivis.                         #
+###############################################################"
 
-    if ! grep -qF "utilisateurs autorises" "${banner_file}" 2>/dev/null; then
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Écriture bannière légale dans /etc/issue et /etc/issue.net"
-        else
-            echo "${banner_text}" | tee "${banner_file}" "${banner_net}" > /dev/null
-        fi
-        success "Bannière légale configurée (/etc/issue et /etc/issue.net)."
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Écriture bannière légale dans /etc/issue et /etc/issue.net"
     else
-        info "Bannière légale déjà en place."
+        echo "${banner_text}" > /etc/issue
+        echo "${banner_text}" > /etc/issue.net
     fi
+    success "Bannière légale configurée (/etc/issue et /etc/issue.net)."
 
     # --- Politique de mots de passe (login.defs) ---
     local login_defs="/etc/login.defs"
     if [[ -f "${login_defs}" ]]; then
-        # Umask restrictif (022 → 027)
-        if grep -q "^UMASK" "${login_defs}"; then
-            run "sed -i 's/^UMASK.*/UMASK\t\t027/' '${login_defs}'"
-        else
-            run "echo 'UMASK		027' >> '${login_defs}'"
-        fi
+        # Helper pour modifier ou ajouter un paramètre dans login.defs
+        _set_login_defs() {
+            local key="$1" value="$2"
+            if grep -q "^${key}" "${login_defs}" 2>/dev/null; then
+                sed -i "s|^${key}.*|${key}    ${value}|" "${login_defs}"
+            elif grep -q "^#.*${key}" "${login_defs}" 2>/dev/null; then
+                sed -i "s|^#.*${key}.*|${key}    ${value}|" "${login_defs}"
+            else
+                echo "${key}    ${value}" >> "${login_defs}"
+            fi
+        }
 
-        # Durée min/max des mots de passe
-        if grep -q "^PASS_MIN_DAYS" "${login_defs}"; then
-            run "sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS\t1/' '${login_defs}'"
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Configuration login.defs (UMASK, SHA_ROUNDS, PASS_MIN/MAX_DAYS)"
         else
-            run "echo 'PASS_MIN_DAYS	1' >> '${login_defs}'"
-        fi
-
-        if grep -q "^PASS_MAX_DAYS" "${login_defs}"; then
-            run "sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS\t365/' '${login_defs}'"
-        else
-            run "echo 'PASS_MAX_DAYS	365' >> '${login_defs}'"
-        fi
-
-        # Rounds de hachage SHA
-        if grep -q "^SHA_ROUNDS" "${login_defs}"; then
-            run "sed -i 's/^SHA_ROUNDS.*/SHA_ROUNDS\t\t5000/' '${login_defs}'"
-        else
-            run "echo 'SHA_ROUNDS		5000' >> '${login_defs}'"
+            _set_login_defs "UMASK" "027"
+            _set_login_defs "PASS_MIN_DAYS" "1"
+            _set_login_defs "PASS_MAX_DAYS" "365"
+            _set_login_defs "SHA_ROUNDS" "5000"
         fi
 
         success "Politique de mots de passe renforcée (login.defs)."
