@@ -910,6 +910,7 @@ skip-test=FIRE-4512
 
 # Pas de kernel propre en LXC
 skip-test=KRNL-5788
+skip-test=KRNL-5830
 
 # sysctl géré par le host
 skip-test=KRNL-6000
