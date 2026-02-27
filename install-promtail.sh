@@ -138,15 +138,16 @@ else
         # Ajouter le repo Grafana si nécessaire
         if [[ ! -f /etc/apt/sources.list.d/grafana.list ]]; then
             info "Ajout du dépôt Grafana..."
-            apt-get install -y -qq apt-transport-https software-properties-common > /dev/null 2>&1
+            apt-get install -y -qq apt-transport-https > /dev/null 2>&1 || true
             mkdir -p /etc/apt/keyrings/
             curl -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor -o /etc/apt/keyrings/grafana.gpg 2>/dev/null
+            chmod 644 /etc/apt/keyrings/grafana.gpg
             echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" \
                 > /etc/apt/sources.list.d/grafana.list
             apt-get update -qq > /dev/null 2>&1
         fi
 
-        apt-get install -y -qq promtail > /dev/null 2>&1
+        apt-get install -y promtail > /dev/null 2>&1 || die "Échec de l'installation de Promtail. Vérifiez : apt install promtail -y"
         success "Promtail installé."
     fi
 fi
