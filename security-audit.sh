@@ -502,12 +502,26 @@ audit_failed_services() {
 audit_ntp() {
     print_section "Synchronisation NTP"
 
-    # Chrony
+    # En LXC, l'horloge est gérée par le host (adjtimex bloqué)
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        result_info "Environnement LXC — NTP géré par le host Proxmox"
+
+        # Vérifier quand même si l'horloge semble raisonnable
+        local timedatectl_synced
+        timedatectl_synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "")
+        if [[ "${timedatectl_synced}" == "yes" ]]; then
+            result_ok "Horloge synchronisée (via le host)"
+        elif [[ -n "${timedatectl_synced}" ]]; then
+            result_warn "Horloge non synchronisée — vérifiez le NTP sur le host Proxmox"
+        fi
+        return
+    fi
+
+    # VM / bare-metal : vérifier chrony ou systemd-timesyncd
     if command -v chronyc &>/dev/null; then
         if systemctl is-active chronyd &>/dev/null || systemctl is-active chrony &>/dev/null; then
             result_ok "Chrony est actif"
 
-            # Vérifier la synchronisation
             local leap
             leap=$(chronyc tracking 2>/dev/null | grep "Leap status" | awk -F: '{print $2}' | xargs || echo "")
             if [[ "${leap}" == "Normal" ]]; then
@@ -520,7 +534,6 @@ audit_ntp() {
         else
             result_crit "Chrony installé mais service inactif"
         fi
-    # systemd-timesyncd
     elif systemctl is-active systemd-timesyncd &>/dev/null; then
         result_ok "systemd-timesyncd est actif"
 

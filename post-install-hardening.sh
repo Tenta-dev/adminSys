@@ -659,9 +659,17 @@ LOGEOF
 
 # --- 12. Synchronisation NTP ---
 module_configure_ntp() {
-    info "━━━ Module 12/20 : Synchronisation NTP (chrony) ━━━"
+    info "━━━ Module 12/20 : Synchronisation NTP ━━━"
 
-    # Préférer chrony à systemd-timesyncd (plus précis, recommandé par Lynis)
+    # En LXC, le kernel est partagé avec le host : adjtimex() est bloqué.
+    # Ni chrony ni systemd-timesyncd ne peuvent ajuster l'horloge.
+    # La synchronisation NTP est gérée par le host Proxmox.
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        warn "Environnement LXC : NTP géré par le host Proxmox (adjtimex non autorisé). Module ignoré."
+        return
+    fi
+
+    # Sur VM/bare-metal : installer chrony (plus précis, recommandé par Lynis)
     run "${PKG_INSTALL} chrony"
 
     # Désactiver systemd-timesyncd s'il est actif (conflit avec chrony)
@@ -1320,6 +1328,7 @@ print_summary() {
     local auditd_status="true"
     local hidepid_status="true"
     local mounts_status="true"
+    local ntp_status="true (chrony)"
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         ufw_status="ignoré (LXC)"
         sysctl_status="ignoré (LXC)"
@@ -1327,6 +1336,7 @@ print_summary() {
         auditd_status="ignoré (LXC)"
         hidepid_status="ignoré (LXC)"
         mounts_status="ignoré (LXC)"
+        ntp_status="ignoré (LXC — géré par le host)"
     fi
 
     echo ""
@@ -1343,7 +1353,7 @@ print_summary() {
     echo -e "${GREEN}║${NC} UFW           : ${ufw_status}"
     echo -e "${GREEN}║${NC} Sysctl        : ${sysctl_status}"
     echo -e "${GREEN}║${NC} Auto-updates  : ${ENABLE_UNATTENDED}"
-    echo -e "${GREEN}║${NC} NTP (chrony)  : true"
+    echo -e "${GREEN}║${NC} NTP           : ${ntp_status}"
     echo -e "${GREEN}║${NC} su restreint  : true (pam_wheel)"
     echo -e "${GREEN}║${NC} Shell TMOUT   : 900s"
     echo -e "${GREEN}║${NC} Core dumps    : désactivés"
