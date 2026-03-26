@@ -233,6 +233,7 @@ module_install_essentials() {
         openssh-server
         logrotate
         bash-completion
+        lynis
     )
 
     run "${PKG_INSTALL} ${packages[*]}"
@@ -1140,6 +1141,18 @@ PWQCEOF
         echo "${banner_text}" > /etc/issue.net
     fi
     success "Bannière légale configurée (/etc/issue et /etc/issue.net)."
+
+    # --- Hardening Postfix (MAIL-8818) ---
+    # Supprimer la version de Postfix de la bannière SMTP
+    if command -v postconf &>/dev/null; then
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Hardening bannière Postfix"
+        else
+            postconf -e 'smtpd_banner = $myhostname ESMTP'
+            systemctl reload postfix 2>/dev/null || true
+        fi
+        success "Bannière Postfix nettoyée (version masquée)."
+    fi
 
     # --- Politique de mots de passe (login.defs) ---
     local login_defs="/etc/login.defs"
