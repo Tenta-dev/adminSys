@@ -12,7 +12,7 @@
 #   -k, --ssh-key <path|url>    Chemin ou URL de la clé publique SSH
 #   -p, --ssh-port <port>       Port SSH personnalisé (défaut: 22)
 #   -h, --hostname <name>       Nom d'hôte à configurer
-#   -t, --telegram              Activer la notification Telegram
+#   -d, --discord               Activer la notification Discord (webhook)
 #   --no-fail2ban               Ne pas installer fail2ban
 #   --no-ufw                    Ne pas configurer UFW
 #   --no-unattended             Ne pas configurer unattended-upgrades
@@ -50,12 +50,11 @@ NEW_HOSTNAME=""
 ENABLE_FAIL2BAN=true
 ENABLE_UFW=true
 ENABLE_UNATTENDED=true
-ENABLE_TELEGRAM=false
+ENABLE_DISCORD=false
 DRY_RUN=false
 
-# Telegram (à configurer si besoin)
-TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+# Discord webhook (à configurer si besoin)
+DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 
 # =============================================================================
 # FONCTIONS UTILITAIRES
@@ -144,7 +143,7 @@ Options :
   -k, --ssh-key <path|url>    Clé publique SSH (fichier local ou URL)
   -p, --ssh-port <port>       Port SSH (défaut: 22)
   -h, --hostname <name>       Nom d'hôte à configurer
-  -t, --telegram              Notification Telegram à la fin
+  -d, --discord               Notification Discord (webhook) à la fin
   --no-fail2ban               Désactiver l'installation de fail2ban
   --no-ufw                    Désactiver la configuration UFW
   --no-unattended             Désactiver unattended-upgrades
@@ -197,7 +196,7 @@ parse_args() {
             -k|--ssh-key)     SSH_KEY="$2";       shift 2 ;;
             -p|--ssh-port)    SSH_PORT="$2";      shift 2 ;;
             -h|--hostname)    NEW_HOSTNAME="$2";  shift 2 ;;
-            -t|--telegram)    ENABLE_TELEGRAM=true; shift ;;
+            -d|--discord)     ENABLE_DISCORD=true; shift ;;
             --no-fail2ban)    ENABLE_FAIL2BAN=false; shift ;;
             --no-ufw)        ENABLE_UFW=false;   shift ;;
             --no-unattended)  ENABLE_UNATTENDED=false; shift ;;
@@ -1286,43 +1285,55 @@ STAMPEOF
     success "Stamp de version écrit dans ${HARDENING_STAMP}."
 }
 
-# --- Notification Telegram ---
-module_notify_telegram() {
-    if [[ "${ENABLE_TELEGRAM}" == false ]]; then
+# --- Notification Discord ---
+module_notify_discord() {
+    if [[ "${ENABLE_DISCORD}" == false ]]; then
         return
     fi
 
-    if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
-        warn "Telegram activé mais TELEGRAM_BOT_TOKEN et/ou TELEGRAM_CHAT_ID non définis."
+    if [[ -z "${DISCORD_WEBHOOK_URL}" ]]; then
+        warn "Discord activé mais DISCORD_WEBHOOK_URL non définie."
+        warn "Exportez cette variable d'environnement avant de lancer le script."
         return
     fi
 
-    info "━━━ Notification Telegram ━━━"
+    info "━━━ Notification Discord ━━━"
 
     local ip_addr
     ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')" || ip_addr="N/A"
     local hostname_val
     hostname_val="$(hostname -f 2>/dev/null)" || hostname_val="$(hostname)"
 
-    local message="🔒 *Hardening terminé*
-🖥 Host : \`${hostname_val}\`
-🌐 IP : \`${ip_addr}\`
-👤 Admin : \`${ADMIN_USER}\`
-🔑 SSH port : \`${SSH_PORT}\`
-📦 OS : ${OS_NAME}
-🏷 Version : v${SCRIPT_VERSION}
-📅 Date : $(date '+%Y-%m-%d %H:%M')"
+    local json_payload
+    json_payload=$(cat << JSONEOF
+{
+  "embeds": [{
+    "title": "🔒 Hardening terminé",
+    "color": 5763719,
+    "fields": [
+      { "name": "🖥 Host",      "value": "\`${hostname_val}\`",    "inline": true },
+      { "name": "🌐 IP",        "value": "\`${ip_addr}\`",         "inline": true },
+      { "name": "👤 Admin",     "value": "\`${ADMIN_USER}\`",      "inline": true },
+      { "name": "🔑 SSH port",  "value": "\`${SSH_PORT}\`",        "inline": true },
+      { "name": "📦 OS",        "value": "${OS_NAME}",             "inline": true },
+      { "name": "🏷 Version",   "value": "v${SCRIPT_VERSION}",     "inline": true }
+    ],
+    "footer": { "text": "post-install-hardening.sh" },
+    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  }]
+}
+JSONEOF
+    )
 
     if [[ "${DRY_RUN}" == false ]]; then
         curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="${message}" \
-            -d parse_mode="Markdown" > /dev/null 2>&1 \
-            && success "Notification Telegram envoyée." \
-            || warn "Échec de l'envoi de la notification Telegram."
+            -H "Content-Type: application/json" \
+            -d "${json_payload}" \
+            "${DISCORD_WEBHOOK_URL}" > /dev/null 2>&1 \
+            && success "Notification Discord envoyée." \
+            || warn "Échec de l'envoi de la notification Discord."
     else
-        info "[DRY-RUN] Notification Telegram préparée."
+        info "[DRY-RUN] Notification Discord préparée."
     fi
 }
 
@@ -1424,7 +1435,7 @@ main() {
     module_auditd_rules
     module_advanced_hardening
     module_write_version_stamp
-    module_notify_telegram
+    module_notify_discord
 
     print_summary
 }

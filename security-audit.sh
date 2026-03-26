@@ -7,8 +7,8 @@
 #   # Audit local sur une machine
 #   ./security-audit.sh
 #
-#   # Avec notification Telegram
-#   ./security-audit.sh --telegram
+#   # Avec notification Discord
+#   ./security-audit.sh --discord
 #
 #   # Export du rapport en fichier
 #   ./security-audit.sh --export /root/reports/
@@ -45,10 +45,9 @@ readonly LYNIS_WARN=70
 readonly LYNIS_CRIT=50
 
 # Variables
-ENABLE_TELEGRAM=false
+ENABLE_DISCORD=false
 EXPORT_DIR=""
-TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 
 # Compteurs globaux
 TOTAL_CHECKS=0
@@ -1132,7 +1131,16 @@ print_report_summary() {
     echo ""
 }
 
-generate_telegram_message() {
+send_discord() {
+    if [[ "${ENABLE_DISCORD}" == false ]]; then
+        return
+    fi
+
+    if [[ -z "${DISCORD_WEBHOOK_URL}" ]]; then
+        echo -e "${YELLOW}[WARN]${NC} Discord activé mais DISCORD_WEBHOOK_URL non définie."
+        return
+    fi
+
     local hostname_val
     hostname_val="$(hostname -f 2>/dev/null || hostname)"
     local ip_addr
@@ -1140,51 +1148,45 @@ generate_telegram_message() {
 
     local status_emoji="🟢"
     local status_label="BON"
+    local embed_color=5763719  # vert
     if [[ "${TOTAL_CRIT}" -gt 0 ]]; then
         status_emoji="🔴"
         status_label="CRITIQUE"
+        embed_color=15548997   # rouge
     elif [[ "${TOTAL_WARN}" -gt 3 ]]; then
         status_emoji="🟡"
         status_label="ATTENTION"
+        embed_color=16776960   # jaune
     elif [[ "${TOTAL_WARN}" -gt 0 ]]; then
         status_emoji="🟡"
         status_label="CORRECT"
+        embed_color=16776960   # jaune
     fi
 
-    cat << EOF
-${status_emoji} *Audit sécurité — ${hostname_val}*
-
-🖥 \`${hostname_val}\` (${ip_addr})
-📊 Statut : *${status_label}*
-
-✅ OK : ${TOTAL_OK}
-⚠️ Avertissements : ${TOTAL_WARN}
-❌ Critiques : ${TOTAL_CRIT}
-
-📅 $(date '+%Y-%m-%d %H:%M')
-EOF
+    local json_payload
+    json_payload=$(cat << JSONEOF
+{
+  "embeds": [{
+    "title": "${status_emoji} Audit sécurité — ${hostname_val}",
+    "color": ${embed_color},
+    "fields": [
+      { "name": "🖥 Host",           "value": "\`${hostname_val}\`\n${ip_addr}", "inline": true },
+      { "name": "📊 Statut",         "value": "**${status_label}**",              "inline": true },
+      { "name": "Résultats",         "value": "✅ ${TOTAL_OK}  ⚠️ ${TOTAL_WARN}  ❌ ${TOTAL_CRIT}", "inline": false }
+    ],
+    "footer": { "text": "security-audit v${SCRIPT_VERSION}" },
+    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  }]
 }
-
-send_telegram() {
-    if [[ "${ENABLE_TELEGRAM}" == false ]]; then
-        return
-    fi
-
-    if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
-        echo -e "${YELLOW}[WARN]${NC} Telegram activé mais TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID non définis."
-        return
-    fi
-
-    local message
-    message=$(generate_telegram_message)
+JSONEOF
+    )
 
     curl -s -X POST \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d chat_id="${TELEGRAM_CHAT_ID}" \
-        -d text="${message}" \
-        -d parse_mode="Markdown" > /dev/null 2>&1 \
-        && echo -e "${GREEN}[OK]${NC} Notification Telegram envoyée." \
-        || echo -e "${YELLOW}[WARN]${NC} Échec de l'envoi Telegram."
+        -H "Content-Type: application/json" \
+        -d "${json_payload}" \
+        "${DISCORD_WEBHOOK_URL}" > /dev/null 2>&1 \
+        && echo -e "${GREEN}[OK]${NC} Notification Discord envoyée." \
+        || echo -e "${YELLOW}[WARN]${NC} Échec de l'envoi Discord."
 }
 
 export_report() {
@@ -1234,7 +1236,7 @@ ${BOLD}USAGE${NC}
     ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}OPTIONS${NC}
-    --telegram              Envoyer le rapport par Telegram
+    --discord               Envoyer le rapport par Discord (webhook)
     --export <dir>          Exporter le rapport en Markdown
     --summary-only          Afficher uniquement le résumé
     --help                  Afficher cette aide
@@ -1265,11 +1267,11 @@ ${BOLD}EXEMPLES${NC}
     # Audit local
     ${SCRIPT_NAME}
 
-    # Avec notification Telegram et export
-    ${SCRIPT_NAME} --telegram --export /root/reports/
+    # Avec notification Discord et export
+    ${SCRIPT_NAME} --discord --export /root/reports/
 
     # En cron quotidien
-    0 7 * * * /usr/local/bin/security-audit --telegram --export /root/reports/
+    0 7 * * * /usr/local/bin/security-audit --discord --export /root/reports/
 
 EOF
     exit 0
@@ -1284,7 +1286,7 @@ SUMMARY_ONLY=false
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --telegram)      ENABLE_TELEGRAM=true;  shift ;;
+            --discord)       ENABLE_DISCORD=true;   shift ;;
             --export)        EXPORT_DIR="$2";       shift 2 ;;
             --summary-only)  SUMMARY_ONLY=true;     shift ;;
             --help|-h)       show_help ;;
@@ -1388,7 +1390,7 @@ main() {
     fi
 
     print_report_summary
-    send_telegram
+    send_discord
     export_report
 
     # Nettoyage
