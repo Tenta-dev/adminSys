@@ -2,15 +2,10 @@
 ###############################################################################
 # security-audit.sh
 # Audit de sécurité pour conteneurs LXC / VMs Proxmox
-# Peut être lancé localement sur une machine ou depuis le host Proxmox
-# sur tout l'inventaire.
 #
 # Usage :
 #   # Audit local sur une machine
 #   ./security-audit.sh
-#
-#   # Depuis le host Proxmox : audit de tout l'inventaire
-#   ./security-audit.sh --all
 #
 #   # Avec notification Telegram
 #   ./security-audit.sh --telegram
@@ -27,8 +22,9 @@ set -euo pipefail
 # CONFIGURATION
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly REPORT_DIR="${REPORT_DIR:-/root/security-reports}"
+readonly HARDENING_STAMP="/etc/hardening-version"
 
 # Couleurs
 readonly RED=$'\033[0;31m'
@@ -49,10 +45,8 @@ readonly LYNIS_WARN=70
 readonly LYNIS_CRIT=50
 
 # Variables
-MODE="local"
 ENABLE_TELEGRAM=false
 EXPORT_DIR=""
-INVENTORY_FILE="/root/inventaire.csv"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
@@ -153,16 +147,24 @@ audit_system_info() {
     echo -e "  Kernel      : ${kernel_ver}"
     echo -e "  Type        : ${CONTAINER_TYPE}"
     echo -e "  Uptime      : ${uptime_val}"
+
+    # Afficher le stamp de hardening si présent
+    if [[ -f "${HARDENING_STAMP}" ]]; then
+        local h_version h_date
+        h_version=$(grep "^version=" "${HARDENING_STAMP}" 2>/dev/null | cut -d= -f2 || echo "inconnue")
+        h_date=$(grep "^date=" "${HARDENING_STAMP}" 2>/dev/null | cut -d= -f2 || echo "inconnue")
+        echo -e "  Hardening   : v${h_version} (${h_date})"
+    else
+        echo -e "  Hardening   : ${YELLOW}aucun stamp trouvé${NC}"
+    fi
 }
 
 # --- 2. Mises à jour de sécurité en attente ---
 audit_pending_updates() {
     print_section "Mises à jour de sécurité"
 
-    # Rafraîchir la liste des paquets silencieusement
     apt-get update -qq 2>/dev/null || true
 
-    # Compter les mises à jour disponibles
     local all_updates=0
     local security_updates=0
 
@@ -207,7 +209,7 @@ audit_pending_updates() {
         fi
     fi
 
-    # Lister les paquets de sécurité en attente si présents
+    # Lister les paquets de sécurité en attente
     if [[ "${security_updates}" -gt 0 ]]; then
         echo ""
         echo -e "  ${DIM}Paquets de sécurité en attente :${NC}"
@@ -220,9 +222,8 @@ audit_pending_updates() {
 audit_ssh() {
     print_section "Configuration SSH"
 
-    # Vérifier si sshd est installé et actif
     if ! command -v sshd &>/dev/null; then
-        result_info "sshd n'est pas installé (peut être normal selon le service)"
+        result_info "sshd n'est pas installé"
         return
     fi
 
@@ -271,13 +272,22 @@ audit_ssh() {
         result_warn "X11 forwarding activé"
     fi
 
-    # AllowUsers défini ?
+    # AllowUsers
     local allow_users
     allow_users=$(sshd -T 2>/dev/null | grep "^allowusers " | awk '{$1=""; print $0}' || echo "")
     if [[ -n "${allow_users}" ]]; then
         result_ok "AllowUsers restreint à :${allow_users}"
     else
         result_warn "AllowUsers non défini (tous les utilisateurs peuvent se connecter)"
+    fi
+
+    # Bannière SSH
+    local banner
+    banner=$(sshd -T 2>/dev/null | grep "^banner " | awk '{print $2}' || echo "none")
+    if [[ "${banner}" != "none" && -f "${banner}" ]]; then
+        result_ok "Bannière SSH active (${banner})"
+    else
+        result_warn "Bannière SSH non configurée"
     fi
 }
 
@@ -297,7 +307,6 @@ audit_fail2ban() {
         return
     fi
 
-    # Vérifier la jail sshd
     if fail2ban-client status sshd &>/dev/null; then
         local banned
         banned=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
@@ -305,7 +314,6 @@ audit_fail2ban() {
         total_banned=$(fail2ban-client status sshd 2>/dev/null | grep "Total banned" | awk '{print $NF}')
         result_ok "Jail SSH active — ${banned} IP bannie(s) actuellement, ${total_banned} au total"
 
-        # Lister les IP bannies si présentes
         if [[ "${banned}" -gt 0 ]]; then
             local banned_list
             banned_list=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP list" | sed 's/.*://;s/^ *//')
@@ -323,24 +331,20 @@ audit_open_ports() {
     local port_count=0
     local seen_ports=""
 
-    # ss -tulnp format: proto state recv-q send-q local_addr:port peer_addr:port process
     while IFS= read -r line; do
         local proto port process addr
         proto=$(echo "${line}" | awk '{print $1}')
         addr=$(echo "${line}" | awk '{print $5}')
         port=$(echo "${addr}" | rev | cut -d: -f1 | rev)
-        # Extraire le nom du process : users:(("sshd",pid=123,fd=4)) → sshd
         process=$(echo "${line}" | grep -oP '"\K[^"]+' | head -1)
         [[ -z "${process}" ]] && process="unknown"
 
-        # Dédupliquer (même port+proto vu en IPv4 et IPv6)
         local key="${proto}/${port}/${process}"
         if echo "${seen_ports}" | grep -qF "${key}"; then
             continue
         fi
         seen_ports="${seen_ports} ${key}"
 
-        # Classifier le port
         case "${port}" in
             22|2222)
                 result_ok "${proto}/${port} — ${process} (SSH)"
@@ -370,7 +374,6 @@ audit_open_ports() {
 audit_users() {
     print_section "Utilisateurs et permissions"
 
-    # Compter les utilisateurs avec un shell de login
     local login_users
     login_users=$(grep -E '/bin/(bash|sh|zsh|fish)$' /etc/passwd | grep -v "^root:" || true)
     local login_count
@@ -384,7 +387,7 @@ audit_users() {
         done <<< "${login_users}"
     fi
 
-    # Utilisateurs avec UID 0 (root)
+    # UID 0
     local uid0_count
     uid0_count=$(awk -F: '$3 == 0 {print $1}' /etc/passwd | wc -l)
     if [[ "${uid0_count}" -gt 1 ]]; then
@@ -394,11 +397,10 @@ audit_users() {
         result_ok "Seul root a l'UID 0"
     fi
 
-    # Utilisateurs sans mot de passe
+    # Utilisateurs sans mot de passe avec shell de login
     local no_password
     no_password=$(awk -F: '($2 == "" || $2 == "!") && $1 != "root" {print $1}' /etc/shadow 2>/dev/null || true)
     if [[ -n "${no_password}" ]]; then
-        # Filtrer les comptes système/verrouillés (c'est normal)
         local real_no_pass=0
         while IFS= read -r user; do
             if grep -qE '/bin/(bash|sh|zsh)$' /etc/passwd | grep "^${user}:" 2>/dev/null; then
@@ -410,7 +412,7 @@ audit_users() {
         fi
     fi
 
-    # Fichiers SUID suspects
+    # SUID suspects
     local suid_files
     suid_files=$(find / -perm -4000 -type f 2>/dev/null | grep -v -E "^/(usr/(bin|lib|libexec|sbin)|bin|sbin|opt|var/lib/(docker|containerd))/" || true)
     local suid_count
@@ -424,7 +426,7 @@ audit_users() {
         result_ok "Aucun fichier SUID suspect détecté"
     fi
 
-    # Fichiers world-writable dans /etc
+    # World-writable dans /etc
     local world_writable
     world_writable=$(find /etc -perm -o+w -type f 2>/dev/null || true)
     local ww_count
@@ -464,7 +466,6 @@ audit_disk() {
         iuse=$(echo "${line}" | awk '{print $5}' | tr -d '%')
         imount=$(echo "${line}" | awk '{print $6}')
 
-        # Ignorer si vide
         [[ -z "${iuse}" || "${iuse}" == "-" ]] && continue
 
         if [[ "${iuse}" -ge 90 ]]; then
@@ -487,10 +488,8 @@ audit_failed_services() {
     if [[ "${failed_count}" -gt 0 ]]; then
         result_crit "${failed_count} service(s) en échec"
         echo "${failed}" | while IFS= read -r line; do
-            # systemctl --failed: "● service.name loaded failed failed Description"
             local svc
             svc=$(echo "${line}" | awk '{print $2}')
-            # Fallback si $2 est vide (format alternatif)
             [[ -z "${svc}" ]] && svc=$(echo "${line}" | awk '{print $1}')
             echo -e "    ${RED}${svc}${NC}"
         done
@@ -499,7 +498,342 @@ audit_failed_services() {
     fi
 }
 
-# --- 9. Docker (si installé) ---
+# --- 9. Synchronisation NTP ---
+audit_ntp() {
+    print_section "Synchronisation NTP"
+
+    # Chrony
+    if command -v chronyc &>/dev/null; then
+        if systemctl is-active chronyd &>/dev/null || systemctl is-active chrony &>/dev/null; then
+            result_ok "Chrony est actif"
+
+            # Vérifier la synchronisation
+            local leap
+            leap=$(chronyc tracking 2>/dev/null | grep "Leap status" | awk -F: '{print $2}' | xargs || echo "")
+            if [[ "${leap}" == "Normal" ]]; then
+                local offset
+                offset=$(chronyc tracking 2>/dev/null | grep "System time" | awk '{print $4}' || echo "N/A")
+                result_ok "Horloge synchronisée (offset: ${offset}s)"
+            else
+                result_warn "Chrony actif mais pas encore synchronisé (leap: ${leap})"
+            fi
+        else
+            result_crit "Chrony installé mais service inactif"
+        fi
+    # systemd-timesyncd
+    elif systemctl is-active systemd-timesyncd &>/dev/null; then
+        result_ok "systemd-timesyncd est actif"
+
+        local synced
+        synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "no")
+        if [[ "${synced}" == "yes" ]]; then
+            result_ok "Horloge synchronisée via systemd-timesyncd"
+        else
+            result_warn "systemd-timesyncd actif mais horloge non synchronisée"
+        fi
+    else
+        result_crit "Aucun service NTP actif (ni chrony, ni systemd-timesyncd)"
+    fi
+}
+
+# --- 10. AppArmor ---
+audit_apparmor() {
+    print_section "AppArmor"
+
+    # En LXC, AppArmor est géré par le host
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        result_info "Environnement LXC — AppArmor géré par le host"
+        return
+    fi
+
+    if ! command -v aa-status &>/dev/null && ! command -v apparmor_status &>/dev/null; then
+        result_crit "AppArmor n'est pas installé"
+        return
+    fi
+
+    local aa_output
+    aa_output=$(aa-status 2>/dev/null || apparmor_status 2>/dev/null || echo "")
+
+    if [[ -z "${aa_output}" ]]; then
+        result_crit "Impossible de lire le statut AppArmor"
+        return
+    fi
+
+    local loaded enforced complain
+    loaded=$(echo "${aa_output}" | grep "profiles are loaded" | awk '{print $1}' || echo "0")
+    enforced=$(echo "${aa_output}" | grep "profiles are in enforce mode" | awk '{print $1}' || echo "0")
+    complain=$(echo "${aa_output}" | grep "profiles are in complain mode" | awk '{print $1}' || echo "0")
+
+    if [[ "${enforced}" -gt 0 ]]; then
+        result_ok "AppArmor actif — ${enforced} profil(s) en enforce, ${complain} en complain"
+    elif [[ "${loaded}" -gt 0 ]]; then
+        result_warn "AppArmor chargé (${loaded} profils) mais aucun en mode enforce"
+    else
+        result_crit "AppArmor sans profil chargé"
+    fi
+
+    if [[ "${complain}" -gt 0 ]]; then
+        result_warn "${complain} profil(s) en mode complain (devraient être en enforce)"
+    fi
+}
+
+# --- 11. Auditd et règles ---
+audit_auditd() {
+    print_section "Auditd"
+
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        result_info "Environnement LXC — auditd non applicable"
+        return
+    fi
+
+    if ! command -v auditd &>/dev/null; then
+        result_warn "auditd n'est pas installé"
+        return
+    fi
+
+    if systemctl is-active auditd &>/dev/null; then
+        result_ok "auditd est actif"
+    else
+        result_crit "auditd est installé mais inactif"
+        return
+    fi
+
+    # Vérifier le nombre de règles chargées
+    local rule_count
+    rule_count=$(auditctl -l 2>/dev/null | grep -cv "^No rules" || echo "0")
+
+    if [[ "${rule_count}" -gt 0 ]]; then
+        result_ok "${rule_count} règle(s) auditd chargée(s)"
+    else
+        result_crit "auditd actif mais AUCUNE règle chargée (pas de surveillance effective)"
+    fi
+
+    # Vérifier si les règles sont immuables
+    local immutable
+    immutable=$(auditctl -s 2>/dev/null | grep "enabled" | awk '{print $2}' || echo "")
+    if [[ "${immutable}" == "2" ]]; then
+        result_ok "Règles auditd verrouillées (immuables)"
+    elif [[ -n "${immutable}" ]]; then
+        result_info "Règles auditd modifiables (enabled=${immutable})"
+    fi
+
+    # Vérifier si le log audit existe et est récent
+    if [[ -f /var/log/audit/audit.log ]]; then
+        local last_event
+        last_event=$(tail -1 /var/log/audit/audit.log 2>/dev/null | grep -oP 'msg=audit\(\K[0-9]+' || echo "0")
+        if [[ "${last_event}" -gt 0 ]]; then
+            local age=$(( $(date +%s) - last_event ))
+            if [[ "${age}" -gt 86400 ]]; then
+                result_warn "Dernier événement audit il y a $((age / 3600))h"
+            else
+                result_ok "Audit log actif (dernier événement il y a $((age / 60))min)"
+            fi
+        fi
+    fi
+}
+
+# --- 12. AIDE (intégrité fichiers) ---
+audit_aide() {
+    print_section "AIDE (intégrité)"
+
+    if ! command -v aide &>/dev/null; then
+        result_info "AIDE n'est pas installé"
+        return
+    fi
+
+    # Vérifier si la base est initialisée
+    if [[ -f /var/lib/aide/aide.db ]]; then
+        result_ok "Base AIDE initialisée"
+
+        # Vérifier la fraîcheur de la base
+        local db_age_days
+        db_age_days=$(( ($(date +%s) - $(stat -c %Y /var/lib/aide/aide.db 2>/dev/null || echo "0")) / 86400 ))
+
+        if [[ "${db_age_days}" -gt 30 ]]; then
+            result_crit "Base AIDE obsolète (${db_age_days} jours) — Exécutez : aideinit"
+        elif [[ "${db_age_days}" -gt 7 ]]; then
+            result_warn "Base AIDE vieille de ${db_age_days} jours — Pensez à la rafraîchir"
+        else
+            result_ok "Base AIDE récente (${db_age_days} jour(s))"
+        fi
+    elif pgrep -f "aideinit|aide.*--config" &>/dev/null; then
+        result_info "AIDE est en cours d'initialisation..."
+    else
+        result_crit "Base AIDE non initialisée — Exécutez : aideinit"
+    fi
+
+    # Vérifier s'il y a un cron AIDE
+    if crontab -l 2>/dev/null | grep -q "aide" || \
+       find /etc/cron.* -name "*aide*" 2>/dev/null | grep -q .; then
+        result_ok "Vérification AIDE planifiée (cron)"
+    else
+        result_warn "Aucune vérification AIDE planifiée — Ajoutez un cron pour 'aide --check'"
+    fi
+}
+
+# --- 13. Montages sécurisés ---
+audit_secure_mounts() {
+    print_section "Montages sécurisés"
+
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        result_info "Environnement LXC — montages gérés par le host"
+        return
+    fi
+
+    # /tmp
+    local tmp_opts
+    tmp_opts=$(mount 2>/dev/null | grep ' /tmp ' | awk '{print $6}' || echo "")
+    if [[ -n "${tmp_opts}" ]]; then
+        if echo "${tmp_opts}" | grep -q "noexec"; then
+            result_ok "/tmp monté avec noexec"
+        else
+            result_warn "/tmp monté SANS noexec (exécution possible)"
+        fi
+    else
+        result_warn "/tmp n'est pas un montage séparé"
+    fi
+
+    # /dev/shm
+    local shm_opts
+    shm_opts=$(mount 2>/dev/null | grep ' /dev/shm ' | awk '{print $6}' || echo "")
+    if [[ -n "${shm_opts}" ]]; then
+        if echo "${shm_opts}" | grep -q "noexec"; then
+            result_ok "/dev/shm monté avec noexec"
+        else
+            result_warn "/dev/shm monté SANS noexec (exécution possible)"
+        fi
+    else
+        result_info "/dev/shm non trouvé dans les montages"
+    fi
+
+    # hidepid sur /proc
+    local proc_opts
+    proc_opts=$(mount 2>/dev/null | grep ' /proc ' | awk '{print $6}' || echo "")
+    if echo "${proc_opts}" | grep -q "hidepid="; then
+        result_ok "/proc monté avec hidepid"
+    else
+        result_warn "/proc monté SANS hidepid (tous les processus visibles par tous)"
+    fi
+}
+
+# --- 14. Core dumps ---
+audit_core_dumps() {
+    print_section "Core dumps"
+
+    local core_disabled=true
+
+    # Vérifier limits.conf
+    if grep -rq "hard core 0" /etc/security/limits.conf /etc/security/limits.d/ 2>/dev/null; then
+        result_ok "Core dumps désactivés (limits.conf)"
+    else
+        result_warn "Core dumps non désactivés dans limits.conf"
+        core_disabled=false
+    fi
+
+    # Vérifier sysctl fs.suid_dumpable
+    local suid_dump
+    suid_dump=$(sysctl -n fs.suid_dumpable 2>/dev/null || echo "")
+    if [[ "${suid_dump}" == "0" ]]; then
+        result_ok "fs.suid_dumpable = 0"
+    elif [[ -n "${suid_dump}" ]]; then
+        result_warn "fs.suid_dumpable = ${suid_dump} (devrait être 0)"
+        core_disabled=false
+    fi
+
+    # Vérifier systemd-coredump
+    if [[ -d /etc/systemd/coredump.conf.d ]]; then
+        if grep -rq "Storage=none" /etc/systemd/coredump.conf.d/ 2>/dev/null; then
+            result_ok "systemd-coredump désactivé (Storage=none)"
+        fi
+    fi
+}
+
+# --- 15. Shell timeout et su restriction ---
+audit_shell_hardening() {
+    print_section "Hardening shell"
+
+    # TMOUT
+    if grep -rq "TMOUT=" /etc/profile.d/ /etc/profile /etc/bash.bashrc 2>/dev/null; then
+        local tmout_val
+        tmout_val=$(grep -rh "TMOUT=" /etc/profile.d/ /etc/profile /etc/bash.bashrc 2>/dev/null | grep -oP 'TMOUT=\K[0-9]+' | head -1)
+        if [[ -n "${tmout_val}" && "${tmout_val}" -le 900 ]]; then
+            result_ok "Shell TMOUT configuré (${tmout_val}s)"
+        else
+            result_warn "Shell TMOUT configuré mais valeur élevée (${tmout_val}s)"
+        fi
+    else
+        result_warn "Aucun TMOUT configuré (sessions shell inactives ne sont pas coupées)"
+    fi
+
+    # Restriction su
+    if grep -q "^auth.*required.*pam_wheel.so" /etc/pam.d/su 2>/dev/null; then
+        result_ok "su restreint au groupe sudo/wheel (pam_wheel.so)"
+    else
+        result_warn "su non restreint (tout utilisateur peut tenter su)"
+    fi
+}
+
+# --- 16. Backups ---
+audit_backups() {
+    print_section "Backups"
+
+    local backup_found=false
+
+    # Vérifier les emplacements communs de backup
+    local backup_dirs=(
+        /var/backups
+        /root/backups
+        /backup
+        /mnt/backup
+    )
+
+    for dir in "${backup_dirs[@]}"; do
+        if [[ -d "${dir}" ]]; then
+            # Chercher des fichiers récents (< 7 jours)
+            local recent_count
+            recent_count=$(find "${dir}" -type f -mtime -7 2>/dev/null | wc -l || echo "0")
+            local total_count
+            total_count=$(find "${dir}" -type f 2>/dev/null | wc -l || echo "0")
+
+            if [[ "${recent_count}" -gt 0 ]]; then
+                result_ok "${dir} — ${recent_count} fichier(s) récent(s) (< 7j), ${total_count} total"
+                backup_found=true
+            elif [[ "${total_count}" -gt 0 ]]; then
+                # Trouver le fichier le plus récent
+                local newest
+                newest=$(find "${dir}" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')
+                local newest_age
+                newest_age=$(( ($(date +%s) - $(stat -c %Y "${newest}" 2>/dev/null || echo "0")) / 86400 ))
+                result_warn "${dir} — backup le plus récent date de ${newest_age} jour(s)"
+                backup_found=true
+            fi
+        fi
+    done
+
+    # Vérifier /var/backups standard (dpkg, apt)
+    if [[ -f /var/backups/dpkg.status.0 ]]; then
+        local dpkg_age
+        dpkg_age=$(( ($(date +%s) - $(stat -c %Y /var/backups/dpkg.status.0 2>/dev/null || echo "0")) / 86400 ))
+        result_info "Backup dpkg : ${dpkg_age} jour(s)"
+    fi
+
+    # Vérifier les tâches de backup planifiées
+    if crontab -l 2>/dev/null | grep -qiE "backup|rsync|borg|restic|duplicity|rclone"; then
+        result_ok "Tâche de backup détectée dans crontab root"
+        backup_found=true
+    fi
+
+    if systemctl list-timers --no-legend 2>/dev/null | grep -qiE "backup|borg|restic"; then
+        result_ok "Timer systemd de backup détecté"
+        backup_found=true
+    fi
+
+    if [[ "${backup_found}" == false ]]; then
+        result_warn "Aucun backup récent ni tâche de backup détecté"
+    fi
+}
+
+# --- 17. Docker (si installé) ---
 audit_docker() {
     if ! command -v docker &>/dev/null; then
         return
@@ -507,7 +841,6 @@ audit_docker() {
 
     print_section "Docker"
 
-    # Docker daemon
     if systemctl is-active docker &>/dev/null; then
         result_ok "Docker daemon actif"
     else
@@ -515,12 +848,10 @@ audit_docker() {
         return
     fi
 
-    # Version Docker
     local docker_version
     docker_version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "inconnue")
     result_info "Docker version ${docker_version}"
 
-    # Conteneurs en cours
     local running
     running=$(docker ps -q 2>/dev/null | wc -l || echo "0")
     local total
@@ -537,48 +868,40 @@ audit_docker() {
         docker ps --filter "status=restarting" --format "    {{.Names}} ({{.Image}})" 2>/dev/null
     fi
 
-    # --- Sécurité des conteneurs en cours ---
     if [[ "${running}" -gt 0 ]]; then
 
-        # Conteneurs en mode privileged
+        # Conteneurs privileged
         local priv_count=0
         while read -r cid; do
             local cname cpriv
             cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
             cpriv=$(docker inspect "${cid}" --format '{{.HostConfig.Privileged}}' 2>/dev/null)
             if [[ "${cpriv}" == "true" ]]; then
-                if [[ "${priv_count}" -eq 0 ]]; then
-                    result_crit "Conteneur(s) en mode --privileged (accès total au host) :"
-                fi
+                [[ "${priv_count}" -eq 0 ]] && result_crit "Conteneur(s) en mode --privileged :"
                 echo -e "    ${RED}${cname}${NC}"
                 priv_count=$((priv_count + 1))
             fi
         done < <(docker ps -q 2>/dev/null)
-        if [[ "${priv_count}" -eq 0 ]]; then
-            result_ok "Aucun conteneur en mode privileged"
-        fi
+        [[ "${priv_count}" -eq 0 ]] && result_ok "Aucun conteneur en mode privileged"
 
-        # Conteneurs en mode --net=host
+        # Conteneurs --net=host
         local nethost_count=0
         while read -r cid; do
             local cname cnet
             cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
             cnet=$(docker inspect "${cid}" --format '{{.HostConfig.NetworkMode}}' 2>/dev/null)
             if [[ "${cnet}" == "host" ]]; then
-                if [[ "${nethost_count}" -eq 0 ]]; then
-                    result_warn "Conteneur(s) en mode --net=host (pas d'isolation réseau) :"
-                fi
+                [[ "${nethost_count}" -eq 0 ]] && result_warn "Conteneur(s) en mode --net=host :"
                 echo -e "    ${YELLOW}${cname}${NC}"
                 nethost_count=$((nethost_count + 1))
             fi
         done < <(docker ps -q 2>/dev/null)
 
-        # Conteneurs exécutant en tant que root
+        # Conteneurs root
         local root_count=0
         local non_root_count=0
         while read -r cid; do
-            local cname cuser
-            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            local cuser
             cuser=$(docker inspect "${cid}" --format '{{.Config.User}}' 2>/dev/null)
             if [[ -z "${cuser}" || "${cuser}" == "root" || "${cuser}" == "0" ]]; then
                 root_count=$((root_count + 1))
@@ -586,72 +909,43 @@ audit_docker() {
                 non_root_count=$((non_root_count + 1))
             fi
         done < <(docker ps -q 2>/dev/null)
-        if [[ "${root_count}" -gt 0 ]]; then
-            result_warn "${root_count} conteneur(s) exécuté(s) en tant que root"
-        fi
-        if [[ "${non_root_count}" -gt 0 ]]; then
-            result_ok "${non_root_count} conteneur(s) exécuté(s) avec un utilisateur non-root"
-        fi
+        [[ "${root_count}" -gt 0 ]] && result_warn "${root_count} conteneur(s) exécuté(s) en tant que root"
+        [[ "${non_root_count}" -gt 0 ]] && result_ok "${non_root_count} conteneur(s) exécuté(s) avec un utilisateur non-root"
 
-        # Conteneurs avec des ports bindés sur 0.0.0.0 (exposés sur toutes les interfaces)
+        # Ports sur 0.0.0.0
         local exposed_count=0
         while read -r cid; do
             local cname ports_all
             cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
             ports_all=$(docker port "${cid}" 2>/dev/null | grep "0.0.0.0:" || true)
             if [[ -n "${ports_all}" ]]; then
-                if [[ "${exposed_count}" -eq 0 ]]; then
-                    result_warn "Conteneur(s) avec des ports exposés sur toutes les interfaces (0.0.0.0) :"
-                fi
+                [[ "${exposed_count}" -eq 0 ]] && result_warn "Conteneur(s) avec ports sur 0.0.0.0 :"
                 echo -e "    ${YELLOW}${cname}${NC} — $(echo "${ports_all}" | awk '{print $3}' | tr '\n' ' ')"
                 exposed_count=$((exposed_count + 1))
             fi
         done < <(docker ps -q 2>/dev/null)
-        if [[ "${exposed_count}" -eq 0 && "${running}" -gt 0 ]]; then
-            result_ok "Aucun port exposé sur 0.0.0.0"
-        fi
+        [[ "${exposed_count}" -eq 0 && "${running}" -gt 0 ]] && result_ok "Aucun port exposé sur 0.0.0.0"
 
-        # Conteneurs sans restart policy
-        local norestart_count=0
-        while read -r cid; do
-            local cname cpolicy
-            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
-            cpolicy=$(docker inspect "${cid}" --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null)
-            if [[ "${cpolicy}" == "no" || -z "${cpolicy}" ]]; then
-                norestart_count=$((norestart_count + 1))
-            fi
-        done < <(docker ps -q 2>/dev/null)
-        if [[ "${norestart_count}" -gt 0 ]]; then
-            result_info "${norestart_count} conteneur(s) sans politique de redémarrage"
-        fi
-
-        # Conteneurs avec le socket Docker monté (risque d'évasion)
+        # Socket Docker monté
         local socket_count=0
         while read -r cid; do
             local cname cmounts
             cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
             cmounts=$(docker inspect "${cid}" --format '{{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null)
             if echo "${cmounts}" | grep -q "docker.sock"; then
-                if [[ "${socket_count}" -eq 0 ]]; then
-                    result_crit "Conteneur(s) avec le socket Docker monté (risque d'évasion) :"
-                fi
+                [[ "${socket_count}" -eq 0 ]] && result_crit "Conteneur(s) avec socket Docker monté :"
                 echo -e "    ${RED}${cname}${NC}"
                 socket_count=$((socket_count + 1))
             fi
         done < <(docker ps -q 2>/dev/null)
-        if [[ "${socket_count}" -eq 0 ]]; then
-            result_ok "Aucun conteneur avec le socket Docker monté"
-        fi
-
+        [[ "${socket_count}" -eq 0 ]] && result_ok "Aucun conteneur avec le socket Docker monté"
     fi
 
-    # --- Hygiène Docker ---
-
-    # Images sans tag (dangling)
+    # Images dangling
     local dangling
     dangling=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l || echo "0")
     if [[ "${dangling}" -gt 0 ]]; then
-        result_warn "${dangling} image(s) orpheline(s) (dangling) — récupérable avec 'docker image prune'"
+        result_warn "${dangling} image(s) orpheline(s) — récupérable avec 'docker image prune'"
     else
         result_ok "Aucune image orpheline"
     fi
@@ -659,88 +953,26 @@ audit_docker() {
     # Volumes orphelins
     local orphan_volumes
     orphan_volumes=$(docker volume ls -f "dangling=true" -q 2>/dev/null | wc -l || echo "0")
-    if [[ "${orphan_volumes}" -gt 0 ]]; then
-        result_warn "${orphan_volumes} volume(s) orphelin(s) — récupérable avec 'docker volume prune'"
-    fi
+    [[ "${orphan_volumes}" -gt 0 ]] && result_warn "${orphan_volumes} volume(s) orphelin(s) — 'docker volume prune'"
 
-    # Docker API exposée sur le réseau
+    # API Docker exposée
     if ss -tlnp 2>/dev/null | grep -q ":2375 \|:2376 "; then
-        result_crit "API Docker exposée sur le réseau (port 2375/2376) — risque majeur"
+        result_crit "API Docker exposée sur le réseau (port 2375/2376)"
     else
         result_ok "API Docker non exposée sur le réseau"
     fi
 
-    # Espace disque Docker
     local docker_disk
     docker_disk=$(docker system df --format '{{.Size}}' 2>/dev/null | head -1 || echo "N/A")
     result_info "Espace Docker utilisé : images=${docker_disk:-N/A}"
 }
 
-# --- 10. Lynis (si installé) ---
-audit_lynis() {
-    if ! command -v lynis &>/dev/null; then
-        print_section "Lynis"
-        result_info "Lynis n'est pas installé — installation recommandée : apt install lynis"
-        return
-    fi
-
-    print_section "Lynis (audit complet)"
-
-    echo -e "  ${DIM}Exécution de Lynis en cours...${NC}"
-
-    # Lancer Lynis silencieusement
-    local lynis_log="/tmp/lynis-audit-$$.log"
-    lynis audit system --no-colors --quick 2>/dev/null > "${lynis_log}" || true
-
-    # Extraire le score
-    local score
-    score=$(grep "Hardening index" "${lynis_log}" 2>/dev/null | grep -oP '\d+' | head -1 || echo "0")
-
-    if [[ "${score}" -ge "${LYNIS_WARN}" ]]; then
-        result_ok "Score Lynis : ${score}/100"
-    elif [[ "${score}" -ge "${LYNIS_CRIT}" ]]; then
-        result_warn "Score Lynis : ${score}/100 (recommandé: > ${LYNIS_WARN})"
-    else
-        result_crit "Score Lynis : ${score}/100 (critique, recommandé: > ${LYNIS_WARN})"
-    fi
-
-    # Extraire les warnings et suggestions
-    local warnings suggestions
-    warnings=$(grep "^  \! " "${lynis_log}" 2>/dev/null || true)
-    suggestions=$(grep "^  - " "${lynis_log}" 2>/dev/null | head -10 || true)
-
-    local warn_count
-    warn_count=$(echo "${warnings}" | grep -c '[^[:space:]]' || true)
-    local sugg_count
-    sugg_count=$(grep -c "^  - " "${lynis_log}" 2>/dev/null || true)
-
-    if [[ "${warn_count}" -gt 0 ]]; then
-        result_warn "${warn_count} avertissement(s) Lynis"
-        echo "${warnings}" | head -10 | while IFS= read -r line; do
-            echo -e "    ${DIM}${line}${NC}"
-        done
-        [[ "${warn_count}" -gt 10 ]] && echo -e "    ${DIM}... et $((warn_count - 10)) autres${NC}"
-    fi
-
-    result_info "${sugg_count} suggestion(s) d'amélioration"
-
-    # Sauvegarder le rapport Lynis complet
-    if [[ -n "${EXPORT_DIR}" ]]; then
-        local lynis_dest="${EXPORT_DIR}/lynis-$(hostname)-$(date '+%Y%m%d').log"
-        cp "${lynis_log}" "${lynis_dest}"
-        echo -e "  ${DIM}Rapport Lynis complet : ${lynis_dest}${NC}"
-    fi
-
-    rm -f "${lynis_log}"
-}
-
-# --- 11. Certificats TLS ---
+# --- 18. Certificats TLS ---
 audit_certificates() {
     print_section "Certificats TLS"
 
     local cert_found=false
 
-    # Vérifier les certificats Let's Encrypt
     if [[ -d /etc/letsencrypt/live ]]; then
         for domain_dir in /etc/letsencrypt/live/*/; do
             [[ -d "${domain_dir}" ]] || continue
@@ -772,7 +1004,6 @@ audit_certificates() {
         done
     fi
 
-    # Vérifier les certificats dans /etc/ssl personnalisés
     for cert in /etc/ssl/certs/local-*.pem /etc/ssl/private/*.crt; do
         [[ -f "${cert}" ]] || continue
         cert_found=true
@@ -799,13 +1030,12 @@ audit_certificates() {
     fi
 }
 
-# --- 12. Crontabs ---
+# --- 19. Crontabs ---
 audit_crontabs() {
     print_section "Tâches planifiées (crontabs)"
 
     local cron_found=false
 
-    # Crontabs utilisateurs
     for user_cron in /var/spool/cron/crontabs/*; do
         [[ -f "${user_cron}" ]] || continue
         cron_found=true
@@ -816,7 +1046,6 @@ audit_crontabs() {
         result_info "Crontab ${user} : ${count} entrée(s)"
     done
 
-    # Cron système
     for cron_dir in /etc/cron.d /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
         if [[ -d "${cron_dir}" ]]; then
             local count
@@ -828,7 +1057,6 @@ audit_crontabs() {
         fi
     done
 
-    # Timers systemd
     local timer_count
     timer_count=$(systemctl list-timers --no-legend 2>/dev/null | wc -l || true)
     if [[ "${timer_count}" -gt 0 ]]; then
@@ -865,7 +1093,6 @@ print_report_summary() {
     echo ""
     print_separator
 
-    # Score global
     local score_color="${GREEN}"
     local score_label="BON"
     if [[ "${TOTAL_CRIT}" -gt 0 ]]; then
@@ -958,7 +1185,6 @@ export_report() {
     hostname_val="$(hostname -s 2>/dev/null || hostname)"
     local report_file="${EXPORT_DIR}/audit-${hostname_val}-$(date '+%Y%m%d_%H%M%S').md"
 
-    # Relancer l'audit en capturant la sortie sans couleurs
     cat > "${report_file}" << MDEOF
 # 🔍 Rapport d'audit sécurité
 
@@ -983,82 +1209,6 @@ MDEOF
 }
 
 # =============================================================================
-# MODE --all (depuis le host Proxmox)
-# =============================================================================
-
-run_on_all_inventory() {
-    if [[ ! -f "${INVENTORY_FILE}" ]]; then
-        echo -e "${RED}[ERREUR]${NC} Fichier d'inventaire introuvable : ${INVENTORY_FILE}"
-        echo "Utilisez 'inventory list' pour vérifier votre inventaire."
-        exit 1
-    fi
-
-    local total
-    total=$(tail -n +2 "${INVENTORY_FILE}" | grep -c '[^[:space:]]' || true)
-
-    echo ""
-    echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║     🔍 AUDIT DE SÉCURITÉ — ${total} machine(s)${NC}"
-    echo -e "${BOLD}║     ${DIM}$(date '+%Y-%m-%d %H:%M:%S')${NC}"
-    echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-
-    local global_ok=0
-    local global_warn=0
-    local global_crit=0
-    local global_unreachable=0
-
-    while IFS=',' read -r hostname ip port user os type date_h; do
-        echo -e "${BOLD}━━━ ${hostname} (${ip}:${port}) ━━━${NC}"
-
-        # Test de connectivité
-        if ! nc -z -w 3 "${ip}" "${port}" 2>/dev/null && ! timeout 3 bash -c "echo >/dev/tcp/${ip}/${port}" 2>/dev/null; then
-            echo -e "  ${RED}✗ Machine injoignable${NC}"
-            global_unreachable=$((global_unreachable + 1))
-            echo ""
-            continue
-        fi
-
-        # Envoyer et exécuter le script sur la machine distante
-        local remote_output
-        remote_output=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-            -p "${port}" "${user}@${ip}" \
-            "curl -fsSL https://raw.githubusercontent.com/Tenta-dev/adminSys/main/security-audit.sh 2>/dev/null | sudo bash -s -- --summary-only" 2>/dev/null) || {
-            echo -e "  ${YELLOW}⚠ Exécution échouée sur ${hostname}${NC}"
-            global_unreachable=$((global_unreachable + 1))
-            echo ""
-            continue
-        }
-
-        echo "${remote_output}"
-
-        # Extraire les compteurs depuis la sortie
-        local ok warn crit
-        ok=$(echo "${remote_output}" | grep -oP '✓ OK\s*:\s*\K\d+' || echo "0")
-        warn=$(echo "${remote_output}" | grep -oP '⚠ Avertissements\s*:\s*\K\d+' || echo "0")
-        crit=$(echo "${remote_output}" | grep -oP '✗ Critiques\s*:\s*\K\d+' || echo "0")
-
-        global_ok=$((global_ok + ok))
-        global_warn=$((global_warn + warn))
-        global_crit=$((global_crit + crit))
-        echo ""
-
-    done < <(tail -n +2 "${INVENTORY_FILE}" | grep '[^[:space:]]' || true)
-
-    # Résumé global
-    echo ""
-    print_separator
-    echo ""
-    echo -e "  ${BOLD}Résumé global — ${total} machine(s)${NC}"
-    echo ""
-    echo -e "  ${GREEN}✓ OK${NC}            : ${global_ok}"
-    echo -e "  ${YELLOW}⚠ Avertissements${NC} : ${global_warn}"
-    echo -e "  ${RED}✗ Critiques${NC}      : ${global_crit}"
-    echo -e "  ${RED}✗ Injoignables${NC}   : ${global_unreachable}"
-    echo ""
-}
-
-# =============================================================================
 # AIDE
 # =============================================================================
 
@@ -1071,19 +1221,36 @@ ${BOLD}USAGE${NC}
     ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}OPTIONS${NC}
-    --all                   Auditer toutes les machines de l'inventaire (depuis le host Proxmox)
     --telegram              Envoyer le rapport par Telegram
     --export <dir>          Exporter le rapport en Markdown
-    --summary-only          Afficher uniquement le résumé (pour mode --all)
-    --inventory <path>      Chemin du fichier inventaire (défaut: /root/inventaire.csv)
+    --summary-only          Afficher uniquement le résumé
     --help                  Afficher cette aide
+
+${BOLD}MODULES D'AUDIT${NC}
+     1. Informations système + stamp hardening
+     2. Mises à jour de sécurité
+     3. Configuration SSH
+     4. Fail2ban
+     5. Ports ouverts
+     6. Utilisateurs et permissions
+     7. Espace disque
+     8. Services systemd
+     9. Synchronisation NTP
+    10. AppArmor
+    11. Auditd et règles
+    12. AIDE (intégrité)
+    13. Montages sécurisés
+    14. Core dumps
+    15. Hardening shell (TMOUT, su)
+    16. Backups
+    17. Docker (si installé)
+    18. Certificats TLS
+    19. Tâches planifiées
+    20. Lynis (si installé)
 
 ${BOLD}EXEMPLES${NC}
     # Audit local
     ${SCRIPT_NAME}
-
-    # Audit de toutes les machines depuis le Proxmox
-    ${SCRIPT_NAME} --all
 
     # Avec notification Telegram et export
     ${SCRIPT_NAME} --telegram --export /root/reports/
@@ -1104,15 +1271,70 @@ SUMMARY_ONLY=false
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --all)           MODE="all";            shift ;;
             --telegram)      ENABLE_TELEGRAM=true;  shift ;;
             --export)        EXPORT_DIR="$2";       shift 2 ;;
             --summary-only)  SUMMARY_ONLY=true;     shift ;;
-            --inventory)     INVENTORY_FILE="$2";   shift 2 ;;
             --help|-h)       show_help ;;
             *) echo -e "${RED}Option inconnue : $1${NC}"; show_help ;;
         esac
     done
+}
+
+# =============================================================================
+# LYNIS
+# =============================================================================
+
+audit_lynis() {
+    if ! command -v lynis &>/dev/null; then
+        print_section "Lynis"
+        result_info "Lynis n'est pas installé — installation recommandée : apt install lynis"
+        return
+    fi
+
+    print_section "Lynis (audit complet)"
+
+    echo -e "  ${DIM}Exécution de Lynis en cours...${NC}"
+
+    local lynis_log="/tmp/lynis-audit-$$.log"
+    lynis audit system --no-colors --quick 2>/dev/null > "${lynis_log}" || true
+
+    local score
+    score=$(grep "Hardening index" "${lynis_log}" 2>/dev/null | grep -oP '\d+' | head -1 || echo "0")
+
+    if [[ "${score}" -ge "${LYNIS_WARN}" ]]; then
+        result_ok "Score Lynis : ${score}/100"
+    elif [[ "${score}" -ge "${LYNIS_CRIT}" ]]; then
+        result_warn "Score Lynis : ${score}/100 (recommandé: > ${LYNIS_WARN})"
+    else
+        result_crit "Score Lynis : ${score}/100 (critique, recommandé: > ${LYNIS_WARN})"
+    fi
+
+    local warnings suggestions
+    warnings=$(grep "^  \! " "${lynis_log}" 2>/dev/null || true)
+    suggestions=$(grep "^  - " "${lynis_log}" 2>/dev/null | head -10 || true)
+
+    local warn_count
+    warn_count=$(echo "${warnings}" | grep -c '[^[:space:]]' || true)
+    local sugg_count
+    sugg_count=$(grep -c "^  - " "${lynis_log}" 2>/dev/null || true)
+
+    if [[ "${warn_count}" -gt 0 ]]; then
+        result_warn "${warn_count} avertissement(s) Lynis"
+        echo "${warnings}" | head -10 | while IFS= read -r line; do
+            echo -e "    ${DIM}${line}${NC}"
+        done
+        [[ "${warn_count}" -gt 10 ]] && echo -e "    ${DIM}... et $((warn_count - 10)) autres${NC}"
+    fi
+
+    result_info "${sugg_count} suggestion(s) d'amélioration"
+
+    if [[ -n "${EXPORT_DIR}" ]]; then
+        local lynis_dest="${EXPORT_DIR}/lynis-$(hostname)-$(date '+%Y%m%d').log"
+        cp "${lynis_log}" "${lynis_dest}"
+        echo -e "  ${DIM}Rapport Lynis complet : ${lynis_dest}${NC}"
+    fi
+
+    rm -f "${lynis_log}"
 }
 
 # =============================================================================
@@ -1123,14 +1345,6 @@ main() {
     parse_args "$@"
 
     check_root
-
-    # Mode --all : exécuter sur tout l'inventaire depuis le Proxmox
-    if [[ "${MODE}" == "all" ]]; then
-        run_on_all_inventory
-        exit 0
-    fi
-
-    # Mode local : audit de la machine courante
     detect_os
     detect_environment
 
@@ -1144,6 +1358,14 @@ main() {
     audit_users
     audit_disk
     audit_failed_services
+    audit_ntp
+    audit_apparmor
+    audit_auditd
+    audit_aide
+    audit_secure_mounts
+    audit_core_dumps
+    audit_shell_hardening
+    audit_backups
     audit_docker
     audit_certificates
     audit_crontabs

@@ -12,7 +12,6 @@
 #   -k, --ssh-key <path|url>    Chemin ou URL de la clé publique SSH
 #   -p, --ssh-port <port>       Port SSH personnalisé (défaut: 22)
 #   -h, --hostname <name>       Nom d'hôte à configurer
-#   -i, --inventory <path>      Chemin du fichier d'inventaire (sur machine locale)
 #   -t, --telegram              Activer la notification Telegram
 #   --no-fail2ban               Ne pas installer fail2ban
 #   --no-ufw                    Ne pas configurer UFW
@@ -29,12 +28,12 @@ set -euo pipefail
 # CONSTANTES & CONFIGURATION PAR DÉFAUT
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly LOG_FILE="/var/log/post-install-hardening.log"
 readonly SYSCTL_HARDENING_FILE="/etc/sysctl.d/99-hardening.conf"
 readonly SSH_CONFIG="/etc/ssh/sshd_config"
 readonly SSH_HARDENING_DIR="/etc/ssh/sshd_config.d"
-readonly INVENTORY_DEFAULT="/root/infrastructure-inventory.csv"
+readonly HARDENING_STAMP="/etc/hardening-version"
 
 # Couleurs pour l'affichage
 readonly RED=$'\033[0;31m'
@@ -48,9 +47,6 @@ ADMIN_USER="admin"
 SSH_KEY=""
 SSH_PORT="22"
 NEW_HOSTNAME=""
-INVENTORY_FILE="${INVENTORY_DEFAULT}"
-PROXMOX_HOST=""
-PROXMOX_INVENTORY="/root/inventaire.csv"
 ENABLE_FAIL2BAN=true
 ENABLE_UFW=true
 ENABLE_UNATTENDED=true
@@ -148,8 +144,6 @@ Options :
   -k, --ssh-key <path|url>    Clé publique SSH (fichier local ou URL)
   -p, --ssh-port <port>       Port SSH (défaut: 22)
   -h, --hostname <name>       Nom d'hôte à configurer
-  -i, --inventory <path>      Fichier d'inventaire CSV (mode local)
-  --proxmox-host <IP|host>    IP du host Proxmox pour inventaire centralisé
   -t, --telegram              Notification Telegram à la fin
   --no-fail2ban               Désactiver l'installation de fail2ban
   --no-ufw                    Désactiver la configuration UFW
@@ -158,19 +152,30 @@ Options :
   --help                      Afficher cette aide
 
 Modules appliqués :
-  1. Mise à jour système + paquets essentiels
-  2. Création utilisateur admin (sudo, clé SSH)
-  3. Hardening SSH (root off, password off, MaxSessions 2, TCPKeepAlive no)
-  4. Fail2ban (SSH jail)
-  5. UFW (VMs uniquement)
-  6. Mises à jour de sécurité automatiques
-  7. Hardening sysctl (VMs uniquement)
-  8. Hardening avancé Lynis (rkhunter, bannière, login.defs, modprobe, permissions)
-  9. Enregistrement inventaire
+   1. Mise à jour système + paquets essentiels
+   2. Configuration hostname
+   3. Création utilisateur admin (sudo, clé SSH)
+   4. Hardening SSH (root off, password off, MaxSessions 2, TCPKeepAlive no)
+   5. Fail2ban (SSH jail)
+   6. UFW (VMs uniquement)
+   7. Mises à jour de sécurité automatiques
+   8. Hardening sysctl (VMs uniquement)
+   9. Désactivation services inutiles
+  10. Configuration logging (journald)
+  11. Synchronisation NTP (chrony)
+  12. Restriction su (pam_wheel)
+  13. Timeout shell (TMOUT)
+  14. Désactivation core dumps
+  15. Montages sécurisés (/tmp, /dev/shm)
+  16. Hidepid /proc (VMs uniquement)
+  17. AppArmor enforcement
+  18. Règles auditd (VMs uniquement)
+  19. Hardening avancé Lynis (rkhunter, bannière, login.defs, modprobe, permissions, passwdqc)
+  20. Stamp de version
 
 Exemples :
-  # Hardening complet avec clé SSH et inventaire centralisé
-  ${SCRIPT_NAME} -u sysadmin -k ~/.ssh/id_ed25519.pub -p 2222 --proxmox-host 192.168.1.1
+  # Hardening complet avec clé SSH
+  ${SCRIPT_NAME} -u sysadmin -k ~/.ssh/id_ed25519.pub -p 2222
 
   # Hardening minimal sans firewall
   ${SCRIPT_NAME} -u admin -k https://github.com/monuser.keys --no-ufw
@@ -192,11 +197,9 @@ parse_args() {
             -k|--ssh-key)     SSH_KEY="$2";       shift 2 ;;
             -p|--ssh-port)    SSH_PORT="$2";      shift 2 ;;
             -h|--hostname)    NEW_HOSTNAME="$2";  shift 2 ;;
-            -i|--inventory)   INVENTORY_FILE="$2"; shift 2 ;;
-            --proxmox-host)   PROXMOX_HOST="$2";  shift 2 ;;
             -t|--telegram)    ENABLE_TELEGRAM=true; shift ;;
             --no-fail2ban)    ENABLE_FAIL2BAN=false; shift ;;
-            --no-ufw)         ENABLE_UFW=false;   shift ;;
+            --no-ufw)        ENABLE_UFW=false;   shift ;;
             --no-unattended)  ENABLE_UNATTENDED=false; shift ;;
             --dry-run)        DRY_RUN=true;       shift ;;
             --help)           show_help ;;
@@ -211,7 +214,7 @@ parse_args() {
 
 # --- 1. Mise à jour système ---
 module_system_update() {
-    info "━━━ Mise à jour du système ━━━"
+    info "━━━ Module 1/20 : Mise à jour du système ━━━"
     run "${PKG_UPDATE}"
     run "${PKG_MANAGER} upgrade -y -qq"
     success "Système mis à jour."
@@ -219,7 +222,7 @@ module_system_update() {
 
 # --- 2. Installation des paquets essentiels ---
 module_install_essentials() {
-    info "━━━ Installation des paquets essentiels ━━━"
+    info "━━━ Module 2/20 : Installation des paquets essentiels ━━━"
 
     local packages=(
         curl wget vim-tiny
@@ -239,7 +242,7 @@ module_install_essentials() {
 # --- 3. Configuration du hostname ---
 module_set_hostname() {
     if [[ -n "${NEW_HOSTNAME}" ]]; then
-        info "━━━ Configuration du hostname : ${NEW_HOSTNAME} ━━━"
+        info "━━━ Module 3/20 : Configuration du hostname : ${NEW_HOSTNAME} ━━━"
         run "hostnamectl set-hostname '${NEW_HOSTNAME}'"
 
         # Mise à jour /etc/hosts
@@ -253,7 +256,7 @@ module_set_hostname() {
 
 # --- 4. Création utilisateur admin ---
 module_create_admin_user() {
-    info "━━━ Création de l'utilisateur admin : ${ADMIN_USER} ━━━"
+    info "━━━ Module 4/20 : Création de l'utilisateur admin : ${ADMIN_USER} ━━━"
 
     if id "${ADMIN_USER}" &>/dev/null; then
         warn "L'utilisateur ${ADMIN_USER} existe déjà, mise à jour de la configuration."
@@ -329,7 +332,7 @@ module_create_admin_user() {
 
 # --- 5. Hardening SSH ---
 module_harden_ssh() {
-    info "━━━ Hardening SSH ━━━"
+    info "━━━ Module 5/20 : Hardening SSH ━━━"
 
     # Créer le répertoire sshd_config.d s'il n'existe pas
     run "mkdir -p '${SSH_HARDENING_DIR}'"
@@ -366,7 +369,7 @@ LoginGraceTime 30
 LogLevel VERBOSE
 
 # Bannière
-Banner none
+Banner /etc/issue.net
 SSHEOF
 
     # Ajout du port personnalisé
@@ -385,8 +388,6 @@ SSHEOF
     run "mkdir -p /run/sshd"
 
     # Ubuntu 24.04+ utilise ssh.socket (activation par socket systemd)
-    # Le socket ignore sshd_config et écoute sur son propre port.
-    # On désactive le socket et on utilise le service classique.
     if systemctl is-active ssh.socket &>/dev/null || systemctl is-enabled ssh.socket &>/dev/null; then
         info "ssh.socket détecté (Ubuntu 24.04+). Bascule vers ssh.service..."
         run "systemctl disable --now ssh.socket"
@@ -397,7 +398,6 @@ SSHEOF
     if [[ "${DRY_RUN}" == false ]]; then
         local sshd_errors
         if sshd_errors="$(sshd -t 2>&1)"; then
-            # Restart (pas reload) : nécessaire pour un changement de port
             run "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true"
             success "SSH hardened et redémarré (port ${SSH_PORT})."
         else
@@ -428,7 +428,7 @@ module_install_fail2ban() {
         return
     fi
 
-    info "━━━ Installation et configuration de fail2ban ━━━"
+    info "━━━ Module 6/20 : Installation et configuration de fail2ban ━━━"
     run "${PKG_INSTALL} fail2ban"
 
     cat > /tmp/fail2ban-jail.local << JAILEOF
@@ -468,13 +468,11 @@ module_configure_ufw() {
 
     # UFW ne fonctionne pas correctement dans les conteneurs LXC non-privilégiés
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
-        warn "Environnement LXC détecté. UFW peut ne pas fonctionner correctement."
-        warn "Le firewall devrait être géré au niveau du host Proxmox (iptables/nftables)."
-        warn "Installation d'UFW ignorée pour ce conteneur."
+        warn "Environnement LXC détecté. UFW ignoré (firewall géré au niveau du host Proxmox)."
         return
     fi
 
-    info "━━━ Configuration du firewall UFW ━━━"
+    info "━━━ Module 7/20 : Configuration du firewall UFW ━━━"
     run "${PKG_INSTALL} ufw"
 
     # Politique par défaut
@@ -502,7 +500,7 @@ module_configure_unattended_upgrades() {
         return
     fi
 
-    info "━━━ Configuration des mises à jour automatiques de sécurité ━━━"
+    info "━━━ Module 8/20 : Configuration des mises à jour automatiques de sécurité ━━━"
     run "${PKG_INSTALL} unattended-upgrades apt-listchanges"
 
     cat > /tmp/50unattended-upgrades << 'UUEOF'
@@ -513,7 +511,6 @@ Unattended-Upgrade::Allowed-Origins {
     "${distro_id}ESM:${distro_codename}-infra-security";
 };
 
-// Ne pas mettre à jour automatiquement les paquets non-sécurité
 Unattended-Upgrade::Package-Blacklist {
 };
 
@@ -547,50 +544,46 @@ AUEOF
 
 # --- 9. Hardening sysctl ---
 module_harden_sysctl() {
-    info "━━━ Hardening kernel (sysctl) ━━━"
+    info "━━━ Module 9/20 : Hardening kernel (sysctl) ━━━"
 
     # En LXC, la plupart des paramètres sysctl ne sont pas modifiables
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
-        warn "Environnement LXC : les paramètres sysctl sont limités."
-        warn "Le hardening kernel doit être appliqué sur le host Proxmox."
+        warn "Environnement LXC : les paramètres sysctl sont limités. Hardening kernel ignoré."
         return
     fi
 
     cat > /tmp/99-hardening.conf << 'SYSCTLEOF'
 # =============================================================================
-# Hardening sysctl — post-install-hardening.sh
+# Hardening sysctl — post-install-hardening.sh v2
 # =============================================================================
 
 # --- Protection réseau ---
-# Désactiver le routage IP (sauf si c'est un routeur)
 net.ipv4.ip_forward = 0
 net.ipv6.conf.all.forwarding = 0
 
-# Protection contre le SYN flood
+# SYN flood
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
 
-# Ignorer les redirections ICMP
+# Redirections ICMP
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
-
-# Ne pas envoyer de redirections ICMP
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 
-# Ignorer les paquets source-routed
+# Source routing
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 
-# Protection contre le spoofing (reverse path filtering)
+# Reverse path filtering (anti-spoofing)
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 
-# Ignorer les pings broadcast (protection smurf)
+# Smurf protection
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 
 # Loguer les paquets martiens
@@ -598,17 +591,13 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1
 
 # --- Protection mémoire ---
-# Restreindre l'accès aux pointeurs kernel
 kernel.kptr_restrict = 2
-
-# Restreindre dmesg aux utilisateurs privilégiés
 kernel.dmesg_restrict = 1
-
-# ASLR complet
 kernel.randomize_va_space = 2
-
-# Restreindre l'utilisation de ptrace
 kernel.yama.ptrace_scope = 1
+
+# --- Core dumps (désactivation) ---
+fs.suid_dumpable = 0
 
 # --- Performances réseau ---
 net.core.rmem_max = 16777216
@@ -629,7 +618,7 @@ SYSCTLEOF
 
 # --- 10. Désactivation de services inutiles ---
 module_disable_unnecessary_services() {
-    info "━━━ Désactivation des services inutiles ━━━"
+    info "━━━ Module 10/20 : Désactivation des services inutiles ━━━"
 
     local services_to_disable=(
         avahi-daemon        # mDNS — inutile sur un serveur
@@ -650,9 +639,8 @@ module_disable_unnecessary_services() {
 
 # --- 11. Configuration des logs ---
 module_configure_logging() {
-    info "━━━ Configuration du logging ━━━"
+    info "━━━ Module 11/20 : Configuration du logging ━━━"
 
-    # Limiter la taille du journal systemd
     run "mkdir -p /etc/systemd/journald.conf.d"
 
     cat > /tmp/size-limit.conf << 'LOGEOF'
@@ -669,9 +657,328 @@ LOGEOF
     success "Journald configuré (max 200M, rétention 1 mois)."
 }
 
-# --- 12. Hardening avancé (recommandations Lynis) ---
+# --- 12. Synchronisation NTP ---
+module_configure_ntp() {
+    info "━━━ Module 12/20 : Synchronisation NTP (chrony) ━━━"
+
+    # Préférer chrony à systemd-timesyncd (plus précis, recommandé par Lynis)
+    run "${PKG_INSTALL} chrony"
+
+    # Désactiver systemd-timesyncd s'il est actif (conflit avec chrony)
+    if systemctl is-active systemd-timesyncd &>/dev/null; then
+        run "systemctl disable --now systemd-timesyncd"
+    fi
+
+    run "systemctl enable chrony"
+    run "systemctl restart chrony"
+
+    # Vérifier la synchronisation
+    if [[ "${DRY_RUN}" == false ]]; then
+        if chronyc tracking &>/dev/null; then
+            success "Chrony installé et synchronisé."
+        else
+            warn "Chrony installé mais pas encore synchronisé (normal au premier démarrage)."
+        fi
+    else
+        success "[DRY-RUN] Chrony configuré."
+    fi
+}
+
+# --- 13. Restriction de su via PAM ---
+module_restrict_su() {
+    info "━━━ Module 13/20 : Restriction de su (pam_wheel) ━━━"
+
+    local pam_su="/etc/pam.d/su"
+
+    if [[ ! -f "${pam_su}" ]]; then
+        warn "/etc/pam.d/su introuvable. Module ignoré."
+        return
+    fi
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Activation pam_wheel.so dans ${pam_su}"
+    else
+        # Activer la ligne pam_wheel.so si elle est commentée
+        if grep -q "^#.*pam_wheel.so" "${pam_su}"; then
+            sed -i 's/^#\s*\(auth\s\+required\s\+pam_wheel.so\)/\1/' "${pam_su}"
+            success "su restreint au groupe sudo/wheel via pam_wheel.so."
+        elif grep -q "^auth.*pam_wheel.so" "${pam_su}"; then
+            info "pam_wheel.so déjà actif dans ${pam_su}."
+        else
+            # Ajouter la ligne si elle n'existe pas du tout
+            sed -i '/^auth\s\+sufficient\s\+pam_rootok.so/a auth       required   pam_wheel.so' "${pam_su}"
+            success "su restreint au groupe sudo/wheel via pam_wheel.so."
+        fi
+    fi
+}
+
+# --- 14. Timeout shell (TMOUT) ---
+module_shell_timeout() {
+    info "━━━ Module 14/20 : Timeout shell (TMOUT) ━━━"
+
+    local tmout_file="/etc/profile.d/99-tmout.sh"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Création ${tmout_file} (TMOUT=900)"
+    else
+        cat > "${tmout_file}" << 'TMEOF'
+# Timeout shell — généré par post-install-hardening.sh
+# Déconnexion automatique après 15 minutes d'inactivité
+readonly TMOUT=900
+export TMOUT
+TMEOF
+        chmod 644 "${tmout_file}"
+    fi
+
+    success "Timeout shell configuré (15 minutes)."
+}
+
+# --- 15. Désactivation des core dumps ---
+module_disable_core_dumps() {
+    info "━━━ Module 15/20 : Désactivation des core dumps ━━━"
+
+    local limits_file="/etc/security/limits.d/99-no-core.conf"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Création ${limits_file}"
+    else
+        cat > "${limits_file}" << 'COREEOF'
+# Désactivation core dumps — post-install-hardening.sh
+* hard core 0
+* soft core 0
+COREEOF
+        chmod 644 "${limits_file}"
+    fi
+
+    # Désactiver aussi dans systemd (coredump service)
+    local coredump_conf="/etc/systemd/coredump.conf.d"
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Configuration systemd-coredump"
+    else
+        mkdir -p "${coredump_conf}"
+        cat > "${coredump_conf}/disable.conf" << 'SDCEOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+SDCEOF
+    fi
+
+    # fs.suid_dumpable est déjà dans le sysctl (module 9)
+    success "Core dumps désactivés (limits.conf + systemd-coredump + sysctl)."
+}
+
+# --- 16. Montages sécurisés (/tmp, /dev/shm) ---
+module_secure_mounts() {
+    info "━━━ Module 16/20 : Montages sécurisés (/tmp, /dev/shm) ━━━"
+
+    # En LXC, les montages sont gérés par le host
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        warn "Environnement LXC : montages gérés par le host. Module ignoré."
+        return
+    fi
+
+    local fstab="/etc/fstab"
+    local changed=false
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Sécurisation des montages /tmp et /dev/shm"
+        return
+    fi
+
+    # /dev/shm — ajouter noexec,nosuid,nodev si pas déjà configuré
+    if grep -q '/dev/shm' "${fstab}"; then
+        # Vérifier si les options sont déjà présentes
+        if ! grep '/dev/shm' "${fstab}" | grep -q 'noexec'; then
+            sed -i '/\/dev\/shm/s/defaults/defaults,noexec,nosuid,nodev/' "${fstab}"
+            changed=true
+        fi
+    else
+        echo "tmpfs /dev/shm tmpfs defaults,noexec,nosuid,nodev 0 0" >> "${fstab}"
+        changed=true
+    fi
+
+    # /tmp — si c'est un tmpfs, ajouter noexec,nosuid,nodev
+    if grep -q '/tmp' "${fstab}"; then
+        if ! grep '/tmp' "${fstab}" | grep -q 'noexec'; then
+            sed -i '/[[:space:]]\/tmp[[:space:]]/s/defaults/defaults,noexec,nosuid,nodev/' "${fstab}"
+            changed=true
+        fi
+    else
+        # Monter /tmp en tmpfs avec les bonnes options
+        echo "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev,size=512M 0 0" >> "${fstab}"
+        changed=true
+    fi
+
+    if [[ "${changed}" == true ]]; then
+        # Remonter immédiatement
+        mount -o remount /dev/shm 2>/dev/null || true
+        mount -o remount /tmp 2>/dev/null || true
+        success "Montages /tmp et /dev/shm sécurisés (noexec,nosuid,nodev)."
+    else
+        info "Montages /tmp et /dev/shm déjà sécurisés."
+    fi
+}
+
+# --- 17. Hidepid /proc ---
+module_hidepid() {
+    info "━━━ Module 17/20 : Hidepid /proc ━━━"
+
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        warn "Environnement LXC : hidepid non applicable. Module ignoré."
+        return
+    fi
+
+    local fstab="/etc/fstab"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Configuration hidepid=2 sur /proc"
+        return
+    fi
+
+    # Vérifier si déjà configuré
+    if grep -q 'hidepid=' "${fstab}" 2>/dev/null; then
+        info "hidepid déjà configuré dans fstab."
+        return
+    fi
+
+    if mount | grep -q 'proc.*hidepid='; then
+        info "hidepid déjà actif."
+        return
+    fi
+
+    # Ajouter au fstab
+    echo "proc /proc proc defaults,hidepid=2,gid=sudo 0 0" >> "${fstab}"
+
+    # Remonter immédiatement
+    mount -o remount,hidepid=2,gid=sudo /proc 2>/dev/null || {
+        warn "Impossible de remonter /proc avec hidepid=2. Sera actif au prochain reboot."
+        return
+    }
+
+    success "hidepid=2 activé sur /proc (seuls les membres de sudo voient tous les processus)."
+}
+
+# --- 18. AppArmor ---
+module_apparmor() {
+    info "━━━ Module 18/20 : AppArmor ━━━"
+
+    # En LXC, AppArmor est géré par le host
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        warn "Environnement LXC : AppArmor géré par le host. Module ignoré."
+        return
+    fi
+
+    # Installer AppArmor s'il n'est pas présent
+    if ! command -v apparmor_status &>/dev/null && ! command -v aa-status &>/dev/null; then
+        run "${PKG_INSTALL} apparmor apparmor-utils"
+    fi
+
+    # S'assurer qu'AppArmor est activé et en enforce
+    if [[ "${DRY_RUN}" == false ]]; then
+        run "systemctl enable apparmor"
+        run "systemctl start apparmor"
+
+        # Mettre tous les profils en mode enforce
+        if command -v aa-enforce &>/dev/null; then
+            aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+        fi
+
+        # Vérifier le statut
+        local profiles_enforced
+        profiles_enforced=$(aa-status 2>/dev/null | grep "profiles are in enforce mode" | awk '{print $1}' || echo "0")
+        success "AppArmor actif — ${profiles_enforced} profil(s) en mode enforce."
+    else
+        success "[DRY-RUN] AppArmor configuré."
+    fi
+}
+
+# --- 19. Règles auditd ---
+module_auditd_rules() {
+    info "━━━ Module 19/20 : Règles auditd ━━━"
+
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        warn "Environnement LXC : auditd non supporté. Module ignoré."
+        return
+    fi
+
+    # auditd est installé dans le module advanced_hardening, vérifier qu'il est présent
+    if ! command -v auditd &>/dev/null; then
+        info "auditd non installé. Les règles seront appliquées si auditd est installé par le module avancé."
+        return
+    fi
+
+    local rules_file="/etc/audit/rules.d/99-hardening.rules"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Création des règles auditd dans ${rules_file}"
+        return
+    fi
+
+    cat > "${rules_file}" << 'AUDITEOF'
+# =============================================================================
+# Règles auditd — post-install-hardening.sh v2
+# Basées sur les recommandations CIS et STIG
+# =============================================================================
+
+# --- Fichiers d'identité et d'authentification ---
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k identity
+-w /etc/sudoers.d/ -p wa -k identity
+
+# --- Configuration SSH ---
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+
+# --- Configuration réseau ---
+-w /etc/hosts -p wa -k network
+-w /etc/hostname -p wa -k network
+-w /etc/resolv.conf -p wa -k network
+
+# --- Cron et tâches planifiées ---
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /var/spool/cron/ -p wa -k cron
+
+# --- Changements de date/heure ---
+-a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time_change
+-a always,exit -F arch=b32 -S adjtimex -S settimeofday -S stime -k time_change
+-w /etc/localtime -p wa -k time_change
+
+# --- Changements de contexte utilisateur ---
+-w /bin/su -p x -k su_usage
+-w /usr/bin/sudo -p x -k sudo_usage
+
+# --- Modules kernel ---
+-w /sbin/insmod -p x -k kernel_modules
+-w /sbin/rmmod -p x -k kernel_modules
+-w /sbin/modprobe -p x -k kernel_modules
+
+# --- Login/Logout ---
+-w /var/log/lastlog -p wa -k login
+-w /var/log/faillog -p wa -k login
+-w /var/log/wtmp -p wa -k login
+-w /var/log/btmp -p wa -k login
+
+# --- Rendre les règles immuables (doit être la dernière ligne) ---
+-e 2
+AUDITEOF
+
+    chmod 640 "${rules_file}"
+
+    # Recharger les règles
+    augenrules --load 2>/dev/null || auditctl -R "${rules_file}" 2>/dev/null || true
+
+    local rule_count
+    rule_count=$(auditctl -l 2>/dev/null | wc -l || echo "0")
+    success "Règles auditd déployées (${rule_count} règles actives)."
+}
+
+# --- 20. Hardening avancé (recommandations Lynis) ---
 module_advanced_hardening() {
-    info "━━━ Hardening avancé (Lynis) ━━━"
+    info "━━━ Module 20/20 : Hardening avancé (Lynis) ━━━"
 
     # --- Paquets de sécurité recommandés ---
     local lynis_packages=(
@@ -698,7 +1005,6 @@ module_advanced_hardening() {
     local packages_to_install=()
     for pkg in "${lynis_packages[@]}"; do
         if ! dpkg -l "${pkg}" 2>/dev/null | grep -q "^ii"; then
-            # Vérifier que le paquet est disponible dans les repos
             if apt-cache show "${pkg}" &>/dev/null; then
                 packages_to_install+=("${pkg}")
             else
@@ -719,20 +1025,15 @@ module_advanced_hardening() {
         run "rkhunter --propupd" 2>/dev/null || true
     fi
 
-    # Initialiser la base AIDE si installé (en arrière-plan, peut être long)
+    # Initialiser la base AIDE si installé
     if command -v aide &>/dev/null; then
-        # Exclusions LXC et stockage média (réduit le bruit et le temps de scan)
         local aide_excl="/etc/aide/aide.conf.d/00_aide_local_exclusions"
         if [[ ! -f "${aide_excl}" ]]; then
-            if [[ "${DRY_RUN}" == true ]]; then
-                info "[DRY-RUN] Création exclusions AIDE"
-            else
+            if [[ "${DRY_RUN}" == false ]]; then
                 cat > "${aide_excl}" << 'AIDEEOF'
 # Exclusions locales — générées par post-install-hardening.sh
-# Répertoires host non accessibles en LXC
 !/dev/.lxc
 !/lost+found
-# Stockage média/données volumineux (pas pertinent pour l'intégrité système)
 !/mnt/data01
 !/mnt/data02
 AIDEEOF
@@ -740,9 +1041,8 @@ AIDEEOF
         fi
 
         if [[ ! -f /var/lib/aide/aide.db ]]; then
-            # Vérifier qu'une init n'est pas déjà en cours
             if pgrep -f "aideinit|aide.*--config" &>/dev/null; then
-                info "AIDE est déjà en cours d'initialisation (PID: $(pgrep -f 'aideinit|aide.*--config' | head -1))."
+                info "AIDE est déjà en cours d'initialisation."
             else
                 info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
                 if [[ "${DRY_RUN}" == false ]]; then
@@ -764,7 +1064,7 @@ AIDEEOF
         run "systemctl enable --now acct" 2>/dev/null || true
     fi
 
-    # Nettoyer acct/auditd si installés en échec sur un LXC (run précédent sans ce fix)
+    # Nettoyer acct/auditd si installés en échec sur un LXC
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         for svc in acct auditd audit-rules; do
             if systemctl is-failed "${svc}" &>/dev/null 2>&1; then
@@ -780,21 +1080,43 @@ AIDEEOF
         run "systemctl enable --now auditd" 2>/dev/null || true
     fi
 
-    # Configurer debsums pour vérification régulière via cron (PKGS-7370)
+    # Configurer debsums pour vérification régulière via cron
     if [[ -f /etc/default/debsums ]]; then
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Activation CRON_CHECK dans /etc/default/debsums"
-        else
+        if [[ "${DRY_RUN}" == false ]]; then
             sed -i 's/^CRON_CHECK=.*/CRON_CHECK=weekly/' /etc/default/debsums 2>/dev/null || true
-            # Si la variable n'existe pas, l'ajouter
             grep -q "^CRON_CHECK" /etc/default/debsums 2>/dev/null || echo "CRON_CHECK=weekly" >> /etc/default/debsums
         fi
     fi
 
     success "Paquets de sécurité installés et configurés."
 
+    # --- Configuration libpam-passwdqc ---
+    local passwdqc_conf="/etc/security/passwdqc.conf"
+    if dpkg -l libpam-passwdqc 2>/dev/null | grep -q "^ii"; then
+        if [[ "${DRY_RUN}" == true ]]; then
+            info "[DRY-RUN] Configuration libpam-passwdqc"
+        else
+            cat > "${passwdqc_conf}" << 'PWQCEOF'
+# Configuration passwdqc — post-install-hardening.sh v2
+# Format min=disabled,disabled,disabled,8,8 :
+#   N0 = mots de passe à 1 classe de caractères (désactivé)
+#   N1 = mots de passe à 2 classes (désactivé)
+#   N2 = passphrase (désactivé — on force N3/N4)
+#   N3 = mots de passe à 3 classes (min 8 caractères)
+#   N4 = mots de passe à 4 classes (min 8 caractères)
+min=disabled,disabled,disabled,8,8
+max=256
+passphrase=3
+match=4
+similar=deny
+enforce=everyone
+retry=3
+PWQCEOF
+            success "libpam-passwdqc configuré (min 8 caractères, 3+ classes)."
+        fi
+    fi
+
     # --- Bannière légale (BANN-7126 / BANN-7130) ---
-    # Lynis cherche des mots-clés anglais : authorized, unauthorized, prohibited, monitored
     local banner_text="###############################################################
 #  Unauthorized access to this system is prohibited.          #
 #  All activity may be monitored and reported.                #
@@ -814,7 +1136,6 @@ AIDEEOF
     # --- Politique de mots de passe (login.defs) ---
     local login_defs="/etc/login.defs"
     if [[ -f "${login_defs}" ]]; then
-        # Helper pour modifier ou ajouter un paramètre dans login.defs
         _set_login_defs() {
             local key="$1" value="$2"
             if grep -q "^${key}" "${login_defs}" 2>/dev/null; then
@@ -826,9 +1147,7 @@ AIDEEOF
             fi
         }
 
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Configuration login.defs (UMASK, SHA_ROUNDS, PASS_MIN/MAX_DAYS)"
-        else
+        if [[ "${DRY_RUN}" == false ]]; then
             _set_login_defs "UMASK" "027"
             _set_login_defs "PASS_MIN_DAYS" "1"
             _set_login_defs "PASS_MAX_DAYS" "365"
@@ -842,9 +1161,7 @@ AIDEEOF
     # --- Désactivation des protocoles réseau inutiles ---
     local modprobe_conf="/etc/modprobe.d/hardening.conf"
     if [[ ! -f "${modprobe_conf}" ]]; then
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Création ${modprobe_conf} (protocoles réseau + USB/FireWire)"
-        else
+        if [[ "${DRY_RUN}" == false ]]; then
             cat > "${modprobe_conf}" << 'MODEOF'
 # Protocoles réseau inutiles — désactivés par post-install-hardening.sh
 install dccp /bin/true
@@ -897,10 +1214,7 @@ MODEOF
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         local lynis_prf="/etc/lynis/custom.prf"
         run "mkdir -p /etc/lynis"
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Création profil Lynis LXC"
-        else
-            # Créer/mettre à jour le profil custom
+        if [[ "${DRY_RUN}" == false ]]; then
             cat > "${lynis_prf}" << 'LYNISEOF'
 # Profil Lynis custom — faux positifs LXC
 # Généré par post-install-hardening.sh
@@ -928,77 +1242,30 @@ LYNISEOF
     success "Hardening avancé terminé."
 }
 
-# --- 13. Enregistrement dans l'inventaire ---
-module_register_inventory() {
-    info "━━━ Enregistrement dans l'inventaire ━━━"
-
-    local ip_addr
-    ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')" || ip_addr="N/A"
-    local hostname_val
-    hostname_val="$(hostname -f 2>/dev/null)" || hostname_val="$(hostname)"
-    local date_install
-    date_install="$(date '+%Y-%m-%d %H:%M:%S')"
-
-    local entry="${hostname_val},${ip_addr},${SSH_PORT},${ADMIN_USER},${OS_NAME},${CONTAINER_TYPE},${date_install}"
-    local header="hostname,ip,ssh_port,admin_user,os,type,date_hardening"
+# --- Stamp de version ---
+module_write_version_stamp() {
+    info "━━━ Écriture du stamp de version ━━━"
 
     if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] Entrée inventaire : ${entry}"
+        info "[DRY-RUN] Écriture de ${HARDENING_STAMP}"
         return
     fi
 
-    # Mode centralisé : envoi vers le host Proxmox via SSH
-    if [[ -n "${PROXMOX_HOST}" ]]; then
-        info "Envoi vers le host Proxmox (${PROXMOX_HOST})..."
+    cat > "${HARDENING_STAMP}" << STAMPEOF
+# Hardening appliqué par post-install-hardening.sh
+version=${SCRIPT_VERSION}
+date=$(date '+%Y-%m-%d %H:%M:%S')
+user=${ADMIN_USER}
+ssh_port=${SSH_PORT}
+os=${OS_NAME}
+type=${CONTAINER_TYPE}
+STAMPEOF
 
-        # Créer le fichier si absent, supprimer l'ancienne entrée (même hostname ou IP), ajouter la nouvelle
-        local remote_cmd="
-            if [ ! -f '${PROXMOX_INVENTORY}' ]; then
-                echo '${header}' > '${PROXMOX_INVENTORY}'
-            fi
-            tmp=\$(mktemp)
-            head -1 '${PROXMOX_INVENTORY}' > \"\${tmp}\"
-            tail -n +2 '${PROXMOX_INVENTORY}' | grep -v '^${hostname_val},\|,${ip_addr},' >> \"\${tmp}\" || true
-            echo '${entry}' >> \"\${tmp}\"
-            mv \"\${tmp}\" '${PROXMOX_INVENTORY}'
-        "
-
-        if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-            "root@${PROXMOX_HOST}" "${remote_cmd}" 2>/dev/null; then
-            success "Machine enregistrée sur ${PROXMOX_HOST}:${PROXMOX_INVENTORY}"
-        else
-            warn "Impossible de joindre le host Proxmox (${PROXMOX_HOST})."
-            warn "Enregistrement local de secours dans ${INVENTORY_FILE}"
-            _register_local "${header}" "${entry}" "${hostname_val}" "${ip_addr}"
-        fi
-    else
-        # Mode local (fallback)
-        _register_local "${header}" "${entry}" "${hostname_val}" "${ip_addr}"
-    fi
+    chmod 644 "${HARDENING_STAMP}"
+    success "Stamp de version écrit dans ${HARDENING_STAMP}."
 }
 
-_register_local() {
-    local header="$1"
-    local entry="$2"
-    local hostname_val="$3"
-    local ip_addr="$4"
-
-    if [[ ! -f "${INVENTORY_FILE}" ]]; then
-        echo "${header}" > "${INVENTORY_FILE}"
-    fi
-
-    # Supprimer l'ancienne entrée si même hostname ou IP
-    local tmp
-    tmp=$(mktemp)
-    head -1 "${INVENTORY_FILE}" > "${tmp}"
-    tail -n +2 "${INVENTORY_FILE}" | grep -v "^${hostname_val},\|,${ip_addr}," >> "${tmp}" || true
-    echo "${entry}" >> "${tmp}"
-    mv "${tmp}" "${INVENTORY_FILE}"
-
-    success "Machine enregistrée dans ${INVENTORY_FILE}"
-}
-
-# --- 13. Notification Telegram ---
+# --- Notification Telegram ---
 module_notify_telegram() {
     if [[ "${ENABLE_TELEGRAM}" == false ]]; then
         return
@@ -1006,7 +1273,6 @@ module_notify_telegram() {
 
     if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
         warn "Telegram activé mais TELEGRAM_BOT_TOKEN et/ou TELEGRAM_CHAT_ID non définis."
-        warn "Exportez ces variables d'environnement avant de lancer le script."
         return
     fi
 
@@ -1023,6 +1289,7 @@ module_notify_telegram() {
 👤 Admin : \`${ADMIN_USER}\`
 🔑 SSH port : \`${SSH_PORT}\`
 📦 OS : ${OS_NAME}
+🏷 Version : v${SCRIPT_VERSION}
 📅 Date : $(date '+%Y-%m-%d %H:%M')"
 
     if [[ "${DRY_RUN}" == false ]]; then
@@ -1049,14 +1316,23 @@ print_summary() {
     # État réel (prend en compte les skips LXC)
     local ufw_status="${ENABLE_UFW}"
     local sysctl_status="true"
+    local apparmor_status="true"
+    local auditd_status="true"
+    local hidepid_status="true"
+    local mounts_status="true"
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         ufw_status="ignoré (LXC)"
         sysctl_status="ignoré (LXC)"
+        apparmor_status="ignoré (LXC)"
+        auditd_status="ignoré (LXC)"
+        hidepid_status="ignoré (LXC)"
+        mounts_status="ignoré (LXC)"
     fi
 
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║              HARDENING TERMINÉ AVEC SUCCÈS                  ║${NC}"
+    echo -e "${GREEN}║              post-install-hardening.sh v${SCRIPT_VERSION}              ║${NC}"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC} OS            : ${OS_NAME}"
     echo -e "${GREEN}║${NC} Type          : ${CONTAINER_TYPE}"
@@ -1067,7 +1343,16 @@ print_summary() {
     echo -e "${GREEN}║${NC} UFW           : ${ufw_status}"
     echo -e "${GREEN}║${NC} Sysctl        : ${sysctl_status}"
     echo -e "${GREEN}║${NC} Auto-updates  : ${ENABLE_UNATTENDED}"
-    echo -e "${GREEN}║${NC} Lynis harden  : true (rkhunter, bannière, modprobe, login.defs)"
+    echo -e "${GREEN}║${NC} NTP (chrony)  : true"
+    echo -e "${GREEN}║${NC} su restreint  : true (pam_wheel)"
+    echo -e "${GREEN}║${NC} Shell TMOUT   : 900s"
+    echo -e "${GREEN}║${NC} Core dumps    : désactivés"
+    echo -e "${GREEN}║${NC} Montages sec. : ${mounts_status}"
+    echo -e "${GREEN}║${NC} hidepid /proc : ${hidepid_status}"
+    echo -e "${GREEN}║${NC} AppArmor      : ${apparmor_status}"
+    echo -e "${GREEN}║${NC} auditd règles : ${auditd_status}"
+    echo -e "${GREEN}║${NC} Lynis harden  : true (rkhunter, bannière, modprobe, login.defs, passwdqc)"
+    echo -e "${GREEN}║${NC} Stamp version : ${HARDENING_STAMP}"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC} Connexion     : ssh -p ${SSH_PORT} ${ADMIN_USER}@${ip_addr}"
     echo -e "${GREEN}║${NC} Log           : ${LOG_FILE}"
@@ -1106,8 +1391,16 @@ main() {
     module_harden_sysctl
     module_disable_unnecessary_services
     module_configure_logging
+    module_configure_ntp
+    module_restrict_su
+    module_shell_timeout
+    module_disable_core_dumps
+    module_secure_mounts
+    module_hidepid
+    module_apparmor
+    module_auditd_rules
     module_advanced_hardening
-    module_register_inventory
+    module_write_version_stamp
     module_notify_telegram
 
     print_summary
