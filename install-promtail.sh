@@ -3,45 +3,45 @@ set -euo pipefail
 
 # ============================================================================
 # install-promtail.sh — Installation et configuration de Promtail
-# Envoie les logs journald (+ fichiers optionnels) vers une instance Loki
+# Envoie les logs journald + fichiers applicatifs vers une instance Loki
 #
-# Usage:
+# Usage interactif:
 #   curl -fsSL https://raw.githubusercontent.com/Tenta-dev/adminSys/main/install-promtail.sh \
 #     | bash -s -- --loki-url http://192.168.2.8:3100
 #
+# Usage automatisé (SaltStack, Ansible, etc.):
+#   bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles arr,nginx,syslog
+#
 # Options:
-#   --loki-url URL        URL de l'instance Loki (requis)
-#   --host NAME           Nom du host (défaut: hostname -s)
-#   --max-age AGE         Âge max des logs à ingérer (défaut: 72h)
-#   --version VER         Version de Promtail à installer (défaut: latest)
-#   --dry-run             Afficher les actions sans les exécuter
-#   --force-update-repo   Forcer apt-get update même si le repo Grafana existe
+#   --loki-url URL           URL de l'instance Loki (requis)
+#   --host NAME              Nom du host (défaut: hostname -s)
+#   --max-age AGE            Âge max des logs journald (défaut: 72h)
+#   --version VER            Version de Promtail à installer (défaut: latest)
+#   --profiles LIST          Profils de logs séparés par des virgules (skip le menu interactif)
+#                            Profils: syslog, nginx, docker, arr, authlog
+#   --custom-path PATH       Chemin personnalisé à scraper (détection auto du format)
+#   --dry-run                Afficher les actions sans les exécuter
+#   --force-update-repo      Forcer apt-get update même si le repo existe
+#   --list-profiles          Lister les profils disponibles et quitter
 # ============================================================================
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="3.0.0"
 
 # --- Couleurs ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 BOLD='\033[1m'
+DIM='\033[2m'
 
 # --- Fonctions d'affichage ---
 info()    { echo -e "${BLUE}[INFO]${NC}    $*"; }
 success() { echo -e "${GREEN}[OK]${NC}      $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}    $*"; }
 die()     { echo -e "${RED}[ERREUR]${NC}  $*" >&2; exit 1; }
-
-# --- Fonction dry-run ---
-run() {
-    if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] $*"
-        return 0
-    fi
-    "$@"
-}
 
 # --- Valeurs par défaut ---
 LOKI_URL=""
@@ -50,8 +50,364 @@ MAX_AGE="72h"
 PROMTAIL_VERSION=""
 DRY_RUN=false
 FORCE_UPDATE_REPO=false
+PROFILES_CLI=""
+CUSTOM_PATHS=()
 
-# --- Parsing des arguments ---
+# ============================================================================
+# PROFILS DE LOGS
+# Chaque profil définit : description, chemins, détection, pipeline_stages
+# ============================================================================
+
+# Liste ordonnée des profils disponibles
+AVAILABLE_PROFILES=(syslog authlog nginx docker arr)
+
+declare -A PROFILE_DESC=(
+    [syslog]="Syslog système (/var/log/syslog)"
+    [authlog]="Logs d'authentification (/var/log/auth.log)"
+    [nginx]="Nginx access + error logs"
+    [docker]="Conteneurs Docker (JSON logs)"
+    [arr]="*Arr stack (Radarr, Sonarr, Lidarr, Prowlarr, etc.)"
+)
+
+# --- Détection de la présence d'un profil sur le système ---
+profile_detect() {
+    local profile="$1"
+    case "${profile}" in
+        syslog)
+            [[ -f /var/log/syslog ]]
+            ;;
+        authlog)
+            [[ -f /var/log/auth.log ]]
+            ;;
+        nginx)
+            command -v nginx &>/dev/null || [[ -d /var/log/nginx ]]
+            ;;
+        docker)
+            command -v docker &>/dev/null || [[ -d /var/lib/docker/containers ]]
+            ;;
+        arr)
+            local arr_found=false
+            for app in radarr sonarr lidarr prowlarr readarr bazarr whisparr; do
+                for dir in "/opt/${app}" "/var/lib/${app}" "/config/logs"; do
+                    [[ -d "${dir}" ]] && arr_found=true && break 2
+                done
+                systemctl list-unit-files "${app}.service" &>/dev/null 2>&1 && arr_found=true && break
+            done
+            ${arr_found}
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# --- Génération du bloc scrape_config pour un profil ---
+profile_scrape_config() {
+    local profile="$1"
+    local host="$2"
+
+    case "${profile}" in
+
+        syslog)
+            cat <<'YAML'
+  # --- Syslog système ---
+  - job_name: syslog
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: syslog
+          host: __HOST__
+          __path__: /var/log/syslog
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\S+ \d+ \S+) (?P<hostname>\S+) (?P<process>[^\[:]+)(?:\[(?P<pid>\d+)\])?: (?P<message>.*)'
+      - timestamp:
+          source: timestamp
+          format: "Jan  2 15:04:05"
+      - output:
+          source: message
+YAML
+            ;;
+
+        authlog)
+            cat <<'YAML'
+  # --- Auth log ---
+  - job_name: authlog
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: authlog
+          host: __HOST__
+          __path__: /var/log/auth.log
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\S+ \d+ \S+) (?P<hostname>\S+) (?P<process>[^\[:]+)(?:\[(?P<pid>\d+)\])?: (?P<message>.*)'
+      - timestamp:
+          source: timestamp
+          format: "Jan  2 15:04:05"
+      - output:
+          source: message
+YAML
+            ;;
+
+        nginx)
+            cat <<'YAML'
+  # --- Nginx access logs ---
+  - job_name: nginx-access
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: nginx
+          log_type: access
+          host: __HOST__
+          __path__: /var/log/nginx/access.log
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<remote_addr>\S+) - (?P<remote_user>\S+) \[(?P<time_local>[^\]]+)\] "(?P<method>\S+) (?P<path>\S+) \S+" (?P<status>\d+) (?P<body_bytes>\d+) "(?P<referer>[^"]*)" "(?P<user_agent>[^"]*)"'
+      - labels:
+          method:
+          status:
+      - timestamp:
+          source: time_local
+          format: "02/Jan/2006:15:04:05 -0700"
+
+  # --- Nginx error logs ---
+  - job_name: nginx-error
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: nginx
+          log_type: error
+          host: __HOST__
+          __path__: /var/log/nginx/error.log
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<message>.*)'
+      - labels:
+          level:
+      - timestamp:
+          source: timestamp
+          format: "2006/01/02 15:04:05"
+      - output:
+          source: message
+YAML
+            ;;
+
+        docker)
+            cat <<'YAML'
+  # --- Docker container logs (JSON) ---
+  - job_name: docker
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: docker
+          host: __HOST__
+          __path__: /var/lib/docker/containers/**/*-json.log
+    pipeline_stages:
+      - json:
+          expressions:
+            log: log
+            stream: stream
+            time: time
+      - labels:
+          stream:
+      - timestamp:
+          source: time
+          format: "RFC3339Nano"
+      - output:
+          source: log
+YAML
+            ;;
+
+        arr)
+            # Détection dynamique des apps *arr installées
+            local arr_configs=""
+            for app in radarr sonarr lidarr prowlarr readarr bazarr whisparr; do
+                local log_dir=""
+                for candidate in \
+                    "/opt/${app}/logs" \
+                    "/var/lib/${app}/logs" \
+                    "/config/logs" \
+                    "/home/${app}/.config/${app^}/logs" \
+                    "/root/.config/${app^}/logs"; do
+                    if [[ -d "${candidate}" ]]; then
+                        log_dir="${candidate}"
+                        break
+                    fi
+                done
+
+                [[ -z "${log_dir}" ]] && continue
+
+                arr_configs+="
+  # --- ${app^} ---
+  - job_name: ${app}
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: ${app}
+          host: __HOST__
+          __path__: ${log_dir}/*.txt
+    pipeline_stages:
+      - multiline:
+          firstline: '^\d{2}-\d{2}-\d{2}'
+      - regex:
+          expression: '^(?P<timestamp>\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)~(?P<level>\w+)~(?P<component>[^~]+)~(?P<message>.*)'
+      - labels:
+          level:
+      - timestamp:
+          source: timestamp
+          format: \"06-01-02 15:04:05.0000000\"
+      - output:
+          source: message
+"
+            done
+
+            if [[ -z "${arr_configs}" ]]; then
+                warn "Profil arr sélectionné mais aucun répertoire de logs trouvé."
+                warn "Chemins vérifiés : /opt/<app>/logs, /var/lib/<app>/logs, /config/logs"
+                return 0
+            fi
+            echo "${arr_configs}"
+            ;;
+    esac
+}
+
+# --- Détection auto du format d'un fichier de log ---
+detect_log_format() {
+    local filepath="$1"
+
+    if [[ ! -f "${filepath}" ]]; then
+        echo "unknown"
+        return
+    fi
+
+    local first_line
+    first_line=$(head -1 "${filepath}" 2>/dev/null || echo "")
+
+    if [[ -z "${first_line}" ]]; then
+        echo "unknown"
+    elif echo "${first_line}" | python3 -c "import sys, json; json.loads(sys.stdin.read())" 2>/dev/null; then
+        echo "json"
+    elif echo "${first_line}" | grep -qP '^\w+=\S+\s+\w+='; then
+        echo "logfmt"
+    else
+        echo "plaintext"
+    fi
+}
+
+# --- Génération de pipeline_stages pour un chemin custom ---
+generate_custom_scrape_config() {
+    local filepath="$1"
+    local host="$2"
+    local job_name
+    job_name=$(basename "$(dirname "${filepath}")" | tr '.' '-' | tr '/' '-')
+    [[ "${job_name}" == "-" || "${job_name}" == "log" ]] && job_name=$(basename "${filepath}" | sed 's/\..*//')
+
+    local format
+    format=$(detect_log_format "${filepath}")
+    info "Format détecté pour ${filepath} : ${format}"
+
+    cat <<YAML
+  # --- Custom: ${filepath} (format: ${format}) ---
+  - job_name: custom-${job_name}
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: ${job_name}
+          host: ${host}
+          __path__: ${filepath}
+YAML
+
+    case "${format}" in
+        json)
+            cat <<'YAML'
+    pipeline_stages:
+      - json:
+          expressions:
+            message: message
+            level: level
+            timestamp: timestamp
+      - labels:
+          level:
+YAML
+            ;;
+        logfmt)
+            cat <<'YAML'
+    pipeline_stages:
+      - logfmt:
+          mapping:
+            level:
+            msg:
+      - labels:
+          level:
+YAML
+            ;;
+        *)
+            echo "    # Format plaintext — pas de pipeline spécifique"
+            echo "    # Ajoutez des pipeline_stages manuellement si nécessaire"
+            ;;
+    esac
+}
+
+# --- Menu interactif ---
+interactive_select_profiles() {
+    local detected=()
+    local not_detected=()
+
+    echo ""
+    echo -e "${BOLD}═══ Profils de logs disponibles ═══${NC}"
+    echo ""
+
+    for profile in "${AVAILABLE_PROFILES[@]}"; do
+        if profile_detect "${profile}" 2>/dev/null; then
+            detected+=("${profile}")
+            echo -e "  ${GREEN}●${NC} ${BOLD}${profile}${NC} — ${PROFILE_DESC[${profile}]} ${GREEN}(détecté)${NC}"
+        else
+            not_detected+=("${profile}")
+            echo -e "  ${DIM}○ ${profile} — ${PROFILE_DESC[${profile}]} (non détecté)${NC}"
+        fi
+    done
+
+    echo ""
+
+    if [[ ${#detected[@]} -gt 0 ]]; then
+        echo -e "${CYAN}Profils détectés : ${detected[*]}${NC}"
+    fi
+
+    echo ""
+    echo -e "Saisissez les profils à activer, séparés par des espaces."
+    echo -e "Appuyez sur ${BOLD}Entrée${NC} pour accepter les profils détectés."
+    echo -e "Tapez ${BOLD}none${NC} pour ne garder que journald."
+    echo ""
+    read -r -p "Profils > " user_input
+
+    if [[ -z "${user_input}" ]]; then
+        SELECTED_PROFILES=("${detected[@]}")
+    elif [[ "${user_input}" == "none" ]]; then
+        SELECTED_PROFILES=()
+    else
+        IFS=' ,' read -ra SELECTED_PROFILES <<< "${user_input}"
+    fi
+
+    # Validation
+    for p in "${SELECTED_PROFILES[@]}"; do
+        if [[ -z "${PROFILE_DESC[${p}]+_}" ]]; then
+            die "Profil inconnu : ${p}. Disponibles : ${AVAILABLE_PROFILES[*]}"
+        fi
+    done
+
+    # Proposer un chemin custom
+    echo ""
+    read -r -p "Chemin de log custom à ajouter (vide pour passer) > " custom_path
+    if [[ -n "${custom_path}" ]]; then
+        CUSTOM_PATHS+=("${custom_path}")
+    fi
+}
+
+# ============================================================================
+# PARSING DES ARGUMENTS
+# ============================================================================
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --loki-url)
@@ -74,6 +430,16 @@ while [[ $# -gt 0 ]]; do
             PROMTAIL_VERSION="$2"
             shift 2
             ;;
+        --profiles)
+            [[ -z "${2:-}" ]] && die "--profiles nécessite une valeur. Ex: --profiles nginx,arr,syslog"
+            PROFILES_CLI="$2"
+            shift 2
+            ;;
+        --custom-path)
+            [[ -z "${2:-}" ]] && die "--custom-path nécessite un chemin."
+            CUSTOM_PATHS+=("$2")
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -82,19 +448,43 @@ while [[ $# -gt 0 ]]; do
             FORCE_UPDATE_REPO=true
             shift
             ;;
+        --list-profiles)
+            echo ""
+            echo "Profils disponibles :"
+            for p in "${AVAILABLE_PROFILES[@]}"; do
+                echo "  ${p} — ${PROFILE_DESC[${p}]}"
+            done
+            echo ""
+            echo "Usage: --profiles syslog,nginx,arr"
+            exit 0
+            ;;
         -h|--help)
             cat <<HELP
 Usage: $0 --loki-url <URL> [OPTIONS]
 
 Options:
-  --loki-url URL           URL de l'instance Loki (requis). Ex: http://192.168.2.8:3100
+  --loki-url URL           URL de l'instance Loki (requis)
   --host NAME              Nom du host (défaut: hostname -s)
-  --max-age AGE            Âge max des logs à ingérer (défaut: 72h)
-  --version VER            Version de Promtail à installer (défaut: latest)
-                           Ex: --version 3.4.2
+  --max-age AGE            Âge max des logs journald (défaut: 72h)
+  --version VER            Version de Promtail (défaut: latest)
+  --profiles LIST          Profils séparés par des virgules (mode non-interactif)
+                           Disponibles : ${AVAILABLE_PROFILES[*]}
+  --custom-path PATH       Chemin custom à scraper (répétable)
   --dry-run                Afficher les actions sans les exécuter
-  --force-update-repo      Forcer apt-get update même si le repo Grafana existe
+  --force-update-repo      Forcer apt-get update
+  --list-profiles          Lister les profils et quitter
   -h, --help               Afficher cette aide
+
+Exemples:
+  # Interactif (menu de sélection)
+  bash install-promtail.sh --loki-url http://192.168.2.8:3100
+
+  # Automatisé (SaltStack, Ansible)
+  bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles arr,syslog
+
+  # Avec chemin custom
+  bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles nginx \\
+    --custom-path /opt/myapp/logs/*.log
 HELP
             exit 0
             ;;
@@ -108,20 +498,16 @@ done
 [[ -z "${LOKI_URL}" ]] && die "--loki-url est requis. Ex: --loki-url http://192.168.2.8:3100"
 [[ "$(id -u)" -ne 0 ]] && die "Ce script doit être exécuté en tant que root."
 
-# Nettoyer l'URL (supprimer le / final si présent)
 LOKI_URL="${LOKI_URL%/}"
 
-# Valider le format de l'URL
 if ! [[ "${LOKI_URL}" =~ ^https?:// ]]; then
     die "L'URL Loki doit commencer par http:// ou https://. Reçu : ${LOKI_URL}"
 fi
 
-# Avertissement si HTTP sans tunnel
 if [[ "${LOKI_URL}" =~ ^http:// ]]; then
     warn "Connexion vers Loki en HTTP clair. Assurez-vous que le trafic est protégé (WireGuard, VLAN isolé, etc.)."
 fi
 
-# Hostname par défaut
 if [[ -z "${HOST_NAME}" ]]; then
     HOST_NAME=$(hostname -s)
 fi
@@ -154,6 +540,38 @@ case "${OS_ID}" in
     *) die "OS non supporté : ${OS_ID}. Seuls Debian et Ubuntu sont supportés." ;;
 esac
 
+# --- Sélection des profils ---
+SELECTED_PROFILES=()
+
+if [[ -n "${PROFILES_CLI}" ]]; then
+    IFS=',' read -ra SELECTED_PROFILES <<< "${PROFILES_CLI}"
+    for p in "${SELECTED_PROFILES[@]}"; do
+        if [[ -z "${PROFILE_DESC[${p}]+_}" ]]; then
+            die "Profil inconnu : ${p}. Disponibles : ${AVAILABLE_PROFILES[*]}"
+        fi
+    done
+    info "Profils sélectionnés (CLI) : ${SELECTED_PROFILES[*]}"
+else
+    # Mode interactif uniquement si stdin est un terminal
+    # (pas de pipe via curl | bash)
+    if [[ -t 0 ]]; then
+        interactive_select_profiles
+    else
+        info "Stdin non-interactif et --profiles non spécifié : journald uniquement."
+        info "Pour ajouter des profils via pipe : ajoutez --profiles arr,syslog,..."
+    fi
+fi
+
+if [[ ${#SELECTED_PROFILES[@]} -gt 0 ]]; then
+    info "Profils activés : ${SELECTED_PROFILES[*]}"
+else
+    info "Aucun profil supplémentaire — journald uniquement."
+fi
+
+if [[ ${#CUSTOM_PATHS[@]} -gt 0 ]]; then
+    info "Chemins custom : ${CUSTOM_PATHS[*]}"
+fi
+
 # --- Test de connectivité vers Loki ---
 info "Test de connectivité vers Loki..."
 if [[ "${DRY_RUN}" == false ]]; then
@@ -179,7 +597,6 @@ else
     info "Installation de Promtail..."
 
     if [[ "${DRY_RUN}" == false ]]; then
-        # Ajouter le repo Grafana si nécessaire
         if [[ ! -f /etc/apt/sources.list.d/grafana.list ]] || [[ "${FORCE_UPDATE_REPO}" == true ]]; then
             info "Ajout/mise à jour du dépôt Grafana..."
             apt-get install -y -qq apt-transport-https > /dev/null 2>&1 || true
@@ -190,18 +607,16 @@ else
                 > /etc/apt/sources.list.d/grafana.list
         fi
 
-        # Toujours mettre à jour le cache pour le repo Grafana
         apt-get update -qq -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/grafana.list \
             -o Dir::Etc::sourceparts="-" > /dev/null 2>&1
 
-        # Installation avec ou sans version pinning
         if [[ -n "${PROMTAIL_VERSION}" ]]; then
             info "Version demandée : ${PROMTAIL_VERSION}"
             apt-get install -y "promtail=${PROMTAIL_VERSION}" > /dev/null 2>&1 \
-                || die "Échec de l'installation de promtail=${PROMTAIL_VERSION}. Versions disponibles : apt-cache policy promtail"
+                || die "Échec de l'installation de promtail=${PROMTAIL_VERSION}. Vérifiez : apt-cache policy promtail"
         else
             apt-get install -y promtail > /dev/null 2>&1 \
-                || die "Échec de l'installation de Promtail. Vérifiez : apt install promtail -y"
+                || die "Échec de l'installation de Promtail."
         fi
 
         installed_version=$(promtail --version 2>&1 | head -1 || echo "?")
@@ -240,24 +655,18 @@ else
     info "[DRY-RUN] mkdir -p ${PROMTAIL_DATA_DIR} && chown promtail:promtail"
 fi
 
-# --- Configuration de Promtail ---
-info "Configuration de Promtail..."
+# --- Génération de la configuration Promtail ---
+info "Génération de la configuration Promtail..."
 
 PROMTAIL_CONFIG="/etc/promtail/config.yml"
 
-if [[ "${DRY_RUN}" == false ]]; then
-    mkdir -p /etc/promtail
+# Assembler la config
+CONFIG_CONTENT=""
 
-    # Backup de la configuration existante
-    if [[ -f "${PROMTAIL_CONFIG}" ]]; then
-        backup_path="${PROMTAIL_CONFIG}.bak.$(date +%s)"
-        cp "${PROMTAIL_CONFIG}" "${backup_path}"
-        info "Backup de la configuration existante : ${backup_path}"
-    fi
-
-    cat > "${PROMTAIL_CONFIG}" << EOF
+read -r -d '' CONFIG_HEADER << EOF || true
 # Configuration Promtail — générée par install-promtail.sh v${SCRIPT_VERSION}
 # Host: ${HOST_NAME} — $(date '+%Y-%m-%d %H:%M:%S')
+# Profils actifs : journald ${SELECTED_PROFILES[*]:-} ${CUSTOM_PATHS[*]:+(custom)}
 #
 # Positions stockées dans ${PROMTAIL_DATA_DIR} (persistant entre redémarrages).
 # gRPC désactivé (grpc_listen_port: 0) — pas de communication inter-promtail.
@@ -273,7 +682,7 @@ clients:
   - url: ${LOKI_URL}/loki/api/v1/push
 
 scrape_configs:
-  # --- Journald (systemd) ---
+  # --- Journald (systemd) — toujours actif ---
   - job_name: journal
     journal:
       max_age: ${MAX_AGE}
@@ -291,9 +700,40 @@ scrape_configs:
         target_label: 'syslog_identifier'
 EOF
 
+CONFIG_CONTENT="${CONFIG_HEADER}"
+
+# Ajouter les profils sélectionnés
+for profile in "${SELECTED_PROFILES[@]}"; do
+    profile_config=$(profile_scrape_config "${profile}" "${HOST_NAME}")
+    profile_config="${profile_config//__HOST__/${HOST_NAME}}"
+    CONFIG_CONTENT+=$'\n'"${profile_config}"
+done
+
+# Ajouter les chemins custom
+for custom_path in "${CUSTOM_PATHS[@]}"; do
+    first_file=$(compgen -G "${custom_path}" 2>/dev/null | head -1 || echo "${custom_path}")
+    custom_config=$(generate_custom_scrape_config "${first_file}" "${HOST_NAME}")
+    custom_config="${custom_config//${first_file}/${custom_path}}"
+    CONFIG_CONTENT+=$'\n'"${custom_config}"
+done
+
+# Écrire la config
+if [[ "${DRY_RUN}" == false ]]; then
+    mkdir -p /etc/promtail
+
+    if [[ -f "${PROMTAIL_CONFIG}" ]]; then
+        backup_path="${PROMTAIL_CONFIG}.bak.$(date +%s)"
+        cp "${PROMTAIL_CONFIG}" "${backup_path}"
+        info "Backup de la configuration existante : ${backup_path}"
+    fi
+
+    echo "${CONFIG_CONTENT}" > "${PROMTAIL_CONFIG}"
     success "Configuration écrite dans ${PROMTAIL_CONFIG}."
 else
-    info "[DRY-RUN] Écriture de la configuration dans ${PROMTAIL_CONFIG}"
+    info "[DRY-RUN] Configuration générée :"
+    echo ""
+    echo "${CONFIG_CONTENT}"
+    echo ""
 fi
 
 # --- Permissions ---
@@ -308,7 +748,15 @@ if [[ "${DRY_RUN}" == false ]]; then
         usermod -aG adm promtail 2>/dev/null || true
     fi
 
-    success "Permissions configurées (groupes: systemd-journal, adm)."
+    # Permissions supplémentaires selon les profils
+    if [[ " ${SELECTED_PROFILES[*]:-} " =~ " docker " ]]; then
+        if getent group docker &>/dev/null; then
+            usermod -aG docker promtail 2>/dev/null || true
+            info "Promtail ajouté au groupe docker."
+        fi
+    fi
+
+    success "Permissions configurées."
 else
     info "[DRY-RUN] usermod -aG systemd-journal,adm promtail"
 fi
@@ -320,7 +768,6 @@ if [[ "${DRY_RUN}" == false ]]; then
     systemctl enable promtail > /dev/null 2>&1
     systemctl restart promtail
 
-    # Vérification via le endpoint /ready de Promtail
     info "Attente du démarrage de Promtail..."
     retries=0
     max_retries=10
@@ -356,14 +803,21 @@ if [[ "${DRY_RUN}" == false ]]; then
     echo -e "║ Positions     : ${PROMTAIL_DATA_DIR}/positions.yaml"
     echo -e "║ Max age       : ${MAX_AGE}"
     echo -e "║ Version       : ${installed_ver}"
+    echo -e "║ Profils       : journald ${SELECTED_PROFILES[*]:-}"
+    [[ ${#CUSTOM_PATHS[@]} -gt 0 ]] && echo -e "║ Custom        : ${CUSTOM_PATHS[*]}"
     echo -e "║ Status        : ${promtail_status}"
     echo -e "${BOLD}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "║ Grafana query : {host=\"${HOST_NAME}\"}"
-    echo -e "║ Erreurs only  : {host=\"${HOST_NAME}\", level=\"err\"}"
+    echo -e "║ Requêtes Grafana utiles :"
+    echo -e "║   Tous les logs  : {host=\"${HOST_NAME}\"}"
+    echo -e "║   Erreurs        : {host=\"${HOST_NAME}\", level=\"err\"}"
+    for p in "${SELECTED_PROFILES[@]}"; do
+        printf "║   %-15s: {host=\"%s\", job=\"%s\"}\n" "${p^}" "${HOST_NAME}" "${p}"
+    done
 else
     echo -e "║ Mode          : DRY-RUN (aucune modification effectuée)"
     echo -e "║ Host          : ${HOST_NAME}"
     echo -e "║ Loki URL      : ${LOKI_URL}"
+    echo -e "║ Profils       : journald ${SELECTED_PROFILES[*]:-}"
 fi
 
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -374,4 +828,5 @@ if [[ "${DRY_RUN}" == false ]]; then
     info "  journalctl -u promtail -f          # Logs Promtail en live"
     info "  curl -s localhost:9080/metrics      # Métriques Promtail"
     info "  curl -s localhost:9080/ready        # Healthcheck"
+    info "  promtail --config.file=${PROMTAIL_CONFIG} --dry-run  # Valider la config"
 fi
