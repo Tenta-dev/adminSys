@@ -25,7 +25,7 @@ set -euo pipefail
 #   --list-profiles          Lister les profils disponibles et quitter
 # ============================================================================
 
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.1.1"
 
 # --- Couleurs ---
 RED='\033[0;31m'
@@ -827,6 +827,17 @@ for profile in "${SELECTED_PROFILES[@]}"; do
     profile_config="${profile_config//__HOST__/${HOST_NAME}}"
     CONFIG_CONTENT+=$'\n'"${profile_config}"
 done
+
+# Reconstituer DETECTED_ARR_APPS depuis la config générée (subshell workaround)
+# profile_scrape_config() est appelé via $() → les variables meurent avec le subshell.
+if [[ " ${SELECTED_PROFILES[*]:-} " =~ " arr " ]]; then
+    DETECTED_ARR_APPS=()
+    for _app in radarr sonarr lidarr prowlarr readarr bazarr whisparr; do
+        if echo "${CONFIG_CONTENT}" | grep -q "job_name: ${_app}"; then
+            DETECTED_ARR_APPS+=("${_app}")
+        fi
+    done
+fi
 
 # Ajouter les chemins custom
 for custom_path in "${CUSTOM_PATHS[@]}"; do
