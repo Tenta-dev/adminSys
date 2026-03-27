@@ -29,7 +29,7 @@ set -euo pipefail
 #   --list-profiles          Lister les profils disponibles et quitter
 # ============================================================================
 
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.3.0"
 
 # --- Couleurs ---
 RED='\033[0;31m'
@@ -57,8 +57,9 @@ FORCE_UPDATE_REPO=false
 PROFILES_CLI=""
 CUSTOM_PATHS=()
 
-# Variable globale pour tracker les apps *arr détectées (utilisée dans le résumé)
+# Variables globales pour tracker les apps détectées dynamiquement (utilisées dans le résumé)
 DETECTED_ARR_APPS=()
+DETECTED_SEERR_APPS=()
 
 # ============================================================================
 # PROFILS DE LOGS
@@ -66,7 +67,7 @@ DETECTED_ARR_APPS=()
 # ============================================================================
 
 # Liste ordonnée des profils disponibles
-AVAILABLE_PROFILES=(syslog authlog nginx docker arr fail2ban aide rkhunter unattended-upgrades)
+AVAILABLE_PROFILES=(syslog authlog nginx docker arr overseerr fail2ban aide rkhunter unattended-upgrades)
 
 declare -A PROFILE_DESC=(
     [syslog]="Syslog système (/var/log/syslog)"
@@ -74,6 +75,7 @@ declare -A PROFILE_DESC=(
     [nginx]="Nginx access + error logs"
     [docker]="Conteneurs Docker (JSON logs)"
     [arr]="*Arr stack (Radarr, Sonarr, Lidarr, Prowlarr, etc.)"
+    [overseerr]="Overseerr / Jellyseerr (request management)"
     [fail2ban]="Fail2ban (/var/log/fail2ban.log)"
     [aide]="AIDE — contrôle d'intégrité (/var/log/aide/aide.log)"
     [rkhunter]="Rkhunter — détection de rootkits (/var/log/rkhunter.log)"
@@ -105,6 +107,12 @@ profile_detect() {
                 systemctl list-unit-files "${app}.service" &>/dev/null 2>&1 && arr_found=true && break
             done
             ${arr_found}
+            ;;
+        overseerr)
+            for app_dir in /opt/overseerr /opt/jellyseerr; do
+                [[ -d "${app_dir}/config/logs" ]] && return 0
+            done
+            return 1
             ;;
         fail2ban)
             [[ -f /var/log/fail2ban.log ]] || command -v fail2ban-client &>/dev/null
@@ -293,6 +301,44 @@ YAML
                 return 0
             fi
             echo "${arr_configs}"
+            ;;
+
+        overseerr)
+            # Détection dynamique : Overseerr ou Jellyseerr
+            local seerr_configs=""
+            for app in overseerr jellyseerr; do
+                local log_dir="/opt/${app}/config/logs"
+                [[ -d "${log_dir}" ]] || continue
+
+                seerr_configs+="
+  # --- ${app^} ---
+  - job_name: ${app}
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: ${app}
+          host: __HOST__
+          __path__: ${log_dir}/*.log
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z)\\s+\\[(?P<level>\\w+)\\]\\[(?P<component>[^\\]]+)\\]:\\s+(?P<message>.*)'
+      - labels:
+          level:
+          component:
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+      - output:
+          source: message
+"
+            done
+
+            if [[ -z "${seerr_configs}" ]]; then
+                warn "Profil overseerr sélectionné mais aucun répertoire de logs trouvé."
+                warn "Chemins vérifiés : /opt/overseerr/config/logs, /opt/jellyseerr/config/logs"
+                return 0
+            fi
+            echo "${seerr_configs}"
             ;;
 
         fail2ban)
@@ -866,6 +912,16 @@ if [[ " ${SELECTED_PROFILES[*]:-} " =~ " arr " ]]; then
     done
 fi
 
+# Même workaround pour overseerr/jellyseerr
+if [[ " ${SELECTED_PROFILES[*]:-} " =~ " overseerr " ]]; then
+    DETECTED_SEERR_APPS=()
+    for _app in overseerr jellyseerr; do
+        if echo "${CONFIG_CONTENT}" | grep -q "job_name: ${_app}"; then
+            DETECTED_SEERR_APPS+=("${_app}")
+        fi
+    done
+fi
+
 # Ajouter les chemins custom
 for custom_path in "${CUSTOM_PATHS[@]}"; do
     first_file=$(compgen -G "${custom_path}" 2>/dev/null | head -1 || echo "${custom_path}")
@@ -997,6 +1053,14 @@ if [[ "${DRY_RUN}" == false ]]; then
                 done
             else
                 printf "║   %-15s: (aucune app *arr détectée)\n" "Arr"
+            fi
+        elif [[ "${p}" == "overseerr" ]]; then
+            if [[ ${#DETECTED_SEERR_APPS[@]} -gt 0 ]]; then
+                for seerr_app in "${DETECTED_SEERR_APPS[@]}"; do
+                    printf "║   %-15s: {host=\"%s\", job=\"%s\"}\n" "${seerr_app^}" "${HOST_NAME}" "${seerr_app}"
+                done
+            else
+                printf "║   %-15s: (aucune app *seerr détectée)\n" "Overseerr"
             fi
         elif [[ "${p}" == "nginx" ]]; then
             printf "║   %-15s: {host=\"%s\", job=\"nginx\", log_type=\"access\"}\n" "Nginx access" "${HOST_NAME}"
