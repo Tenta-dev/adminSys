@@ -18,7 +18,7 @@ set -euo pipefail
 #   --force-update-repo   Forcer apt-get update même si le repo Grafana existe
 # ============================================================================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 # --- Couleurs ---
 RED='\033[0;31m'
@@ -209,6 +209,22 @@ else
     else
         info "[DRY-RUN] apt-get install promtail${PROMTAIL_VERSION:+=${PROMTAIL_VERSION}}"
     fi
+fi
+
+# --- Utilisateur système Promtail ---
+if [[ "${DRY_RUN}" == false ]]; then
+    if ! id -u promtail &>/dev/null; then
+        info "Création de l'utilisateur système promtail..."
+        useradd --system --no-create-home --shell /usr/sbin/nologin --user-group promtail
+        success "Utilisateur promtail créé."
+    elif ! getent group promtail &>/dev/null; then
+        info "Création du groupe promtail..."
+        groupadd --system promtail
+        usermod -g promtail promtail
+        success "Groupe promtail créé."
+    fi
+else
+    info "[DRY-RUN] Vérification/création de l'utilisateur promtail"
 fi
 
 # --- Répertoire de données Promtail ---
