@@ -18,14 +18,14 @@ set -euo pipefail
 #   --max-age AGE            Âge max des logs journald (défaut: 72h)
 #   --version VER            Version de Promtail à installer (défaut: latest)
 #   --profiles LIST          Profils de logs séparés par des virgules (skip le menu interactif)
-#                            Profils: syslog, nginx, docker, arr, authlog
+#                            Profils: syslog, authlog, nginx, docker, arr, fail2ban, aide, rkhunter, unattended-upgrades
 #   --custom-path PATH       Chemin personnalisé à scraper (détection auto du format)
 #   --dry-run                Afficher les actions sans les exécuter
 #   --force-update-repo      Forcer apt-get update même si le repo existe
 #   --list-profiles          Lister les profils disponibles et quitter
 # ============================================================================
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 
 # --- Couleurs ---
 RED='\033[0;31m'
@@ -53,13 +53,16 @@ FORCE_UPDATE_REPO=false
 PROFILES_CLI=""
 CUSTOM_PATHS=()
 
+# Variable globale pour tracker les apps *arr détectées (utilisée dans le résumé)
+DETECTED_ARR_APPS=()
+
 # ============================================================================
 # PROFILS DE LOGS
 # Chaque profil définit : description, chemins, détection, pipeline_stages
 # ============================================================================
 
 # Liste ordonnée des profils disponibles
-AVAILABLE_PROFILES=(syslog authlog nginx docker arr)
+AVAILABLE_PROFILES=(syslog authlog nginx docker arr fail2ban aide rkhunter unattended-upgrades)
 
 declare -A PROFILE_DESC=(
     [syslog]="Syslog système (/var/log/syslog)"
@@ -67,6 +70,10 @@ declare -A PROFILE_DESC=(
     [nginx]="Nginx access + error logs"
     [docker]="Conteneurs Docker (JSON logs)"
     [arr]="*Arr stack (Radarr, Sonarr, Lidarr, Prowlarr, etc.)"
+    [fail2ban]="Fail2ban (/var/log/fail2ban.log)"
+    [aide]="AIDE — contrôle d'intégrité (/var/log/aide/aide.log)"
+    [rkhunter]="Rkhunter — détection de rootkits (/var/log/rkhunter.log)"
+    [unattended-upgrades]="Mises à jour automatiques (/var/log/unattended-upgrades/)"
 )
 
 # --- Détection de la présence d'un profil sur le système ---
@@ -94,6 +101,18 @@ profile_detect() {
                 systemctl list-unit-files "${app}.service" &>/dev/null 2>&1 && arr_found=true && break
             done
             ${arr_found}
+            ;;
+        fail2ban)
+            [[ -f /var/log/fail2ban.log ]] || command -v fail2ban-client &>/dev/null
+            ;;
+        aide)
+            [[ -d /var/log/aide ]] || command -v aide &>/dev/null
+            ;;
+        rkhunter)
+            [[ -f /var/log/rkhunter.log ]] || command -v rkhunter &>/dev/null
+            ;;
+        unattended-upgrades)
+            [[ -d /var/log/unattended-upgrades ]]
             ;;
         *)
             return 1
@@ -222,6 +241,7 @@ YAML
         arr)
             # Détection dynamique des apps *arr installées
             local arr_configs=""
+            DETECTED_ARR_APPS=()
             for app in radarr sonarr lidarr prowlarr readarr bazarr whisparr; do
                 local log_dir=""
                 for candidate in \
@@ -238,6 +258,7 @@ YAML
 
                 [[ -z "${log_dir}" ]] && continue
 
+                DETECTED_ARR_APPS+=("${app}")
                 arr_configs+="
   # --- ${app^} ---
   - job_name: ${app}
@@ -249,14 +270,14 @@ YAML
           __path__: ${log_dir}/*.txt
     pipeline_stages:
       - multiline:
-          firstline: '^\d{2}-\d{2}-\d{2}'
+          firstline: '^\d{4}-\d{2}-\d{2}'
       - regex:
-          expression: '^(?P<timestamp>\d{2}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)~(?P<level>\w+)~(?P<component>[^~]+)~(?P<message>.*)'
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\|(?P<level>\w+)\|(?P<component>[^|]+)\|(?P<message>.*)'
       - labels:
           level:
       - timestamp:
           source: timestamp
-          format: \"06-01-02 15:04:05.0000000\"
+          format: \"2006-01-02 15:04:05.0\"
       - output:
           source: message
 "
@@ -268,6 +289,104 @@ YAML
                 return 0
             fi
             echo "${arr_configs}"
+            ;;
+
+        fail2ban)
+            cat <<'YAML'
+  # --- Fail2ban ---
+  - job_name: fail2ban
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: fail2ban
+          host: __HOST__
+          __path__: /var/log/fail2ban.log
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+fail2ban\.(?P<component>\S+)\s+\[(?P<pid>\d+)\]:\s+(?P<level>\w+)\s+(?P<message>.*)'
+      - labels:
+          level:
+          component:
+      - timestamp:
+          source: timestamp
+          format: "2006-01-02 15:04:05,000"
+      - output:
+          source: message
+YAML
+            ;;
+
+        aide)
+            cat <<'YAML'
+  # --- AIDE (contrôle d'intégrité) ---
+  - job_name: aide
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: aide
+          host: __HOST__
+          __path__: /var/log/aide/*.log
+    pipeline_stages:
+      - multiline:
+          firstline: '^(Start timestamp|AIDE|Summary|---)'
+          max_wait_time: 3s
+YAML
+            ;;
+
+        rkhunter)
+            cat <<'YAML'
+  # --- Rkhunter ---
+  - job_name: rkhunter
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: rkhunter
+          host: __HOST__
+          __path__: /var/log/rkhunter.log
+    pipeline_stages:
+      - multiline:
+          firstline: '^\[\d{2}:\d{2}:\d{2}\]|^System checks summary'
+          max_wait_time: 3s
+      - regex:
+          expression: '^\[(?P<timestamp>\d{2}:\d{2}:\d{2})\]\s+(?P<message>.*)'
+      - output:
+          source: message
+YAML
+            ;;
+
+        unattended-upgrades)
+            cat <<'YAML'
+  # --- Unattended Upgrades ---
+  - job_name: unattended-upgrades
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: unattended-upgrades
+          host: __HOST__
+          __path__: /var/log/unattended-upgrades/unattended-upgrades.log
+    pipeline_stages:
+      - regex:
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) (?P<level>\w+)\s+(?P<message>.*)'
+      - labels:
+          level:
+      - timestamp:
+          source: timestamp
+          format: "2006-01-02 15:04:05,000"
+      - output:
+          source: message
+
+  # --- Unattended Upgrades dpkg log ---
+  - job_name: unattended-upgrades-dpkg
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: unattended-upgrades
+          log_type: dpkg
+          host: __HOST__
+          __path__: /var/log/unattended-upgrades/unattended-upgrades-dpkg.log
+    pipeline_stages:
+      - regex:
+          expression: '^Log started: (?P<timestamp>.+)|(?P<message>.+)'
+YAML
             ;;
     esac
 }
@@ -455,7 +574,7 @@ while [[ $# -gt 0 ]]; do
                 echo "  ${p} — ${PROFILE_DESC[${p}]}"
             done
             echo ""
-            echo "Usage: --profiles syslog,nginx,arr"
+            echo "Usage: --profiles syslog,nginx,arr,fail2ban"
             exit 0
             ;;
         -h|--help)
@@ -480,7 +599,7 @@ Exemples:
   bash install-promtail.sh --loki-url http://192.168.2.8:3100
 
   # Automatisé (SaltStack, Ansible)
-  bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles arr,syslog
+  bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles arr,syslog,fail2ban
 
   # Avec chemin custom
   bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles nginx \\
@@ -756,9 +875,30 @@ if [[ "${DRY_RUN}" == false ]]; then
         fi
     fi
 
+    # Permissions lecture pour les logs AIDE et rkhunter (souvent root-only)
+    if [[ " ${SELECTED_PROFILES[*]:-} " =~ " aide " ]]; then
+        if [[ -d /var/log/aide ]]; then
+            setfacl -R -m u:promtail:r /var/log/aide 2>/dev/null \
+                || chmod -R o+r /var/log/aide 2>/dev/null \
+                || warn "Impossible de donner accès à /var/log/aide — vérifiez les ACL manuellement."
+            info "Permissions lecture accordées sur /var/log/aide."
+        fi
+    fi
+
+    if [[ " ${SELECTED_PROFILES[*]:-} " =~ " rkhunter " ]]; then
+        if [[ -f /var/log/rkhunter.log ]]; then
+            setfacl -m u:promtail:r /var/log/rkhunter.log 2>/dev/null \
+                || chmod o+r /var/log/rkhunter.log 2>/dev/null \
+                || warn "Impossible de donner accès à /var/log/rkhunter.log — vérifiez les ACL manuellement."
+            info "Permissions lecture accordées sur /var/log/rkhunter.log."
+        fi
+    fi
+
     success "Permissions configurées."
 else
     info "[DRY-RUN] usermod -aG systemd-journal,adm promtail"
+    [[ " ${SELECTED_PROFILES[*]:-} " =~ " aide " ]] && info "[DRY-RUN] setfacl -R -m u:promtail:r /var/log/aide"
+    [[ " ${SELECTED_PROFILES[*]:-} " =~ " rkhunter " ]] && info "[DRY-RUN] setfacl -m u:promtail:r /var/log/rkhunter.log"
 fi
 
 # --- Démarrage ---
@@ -811,7 +951,23 @@ if [[ "${DRY_RUN}" == false ]]; then
     echo -e "║   Tous les logs  : {host=\"${HOST_NAME}\"}"
     echo -e "║   Erreurs        : {host=\"${HOST_NAME}\", level=\"err\"}"
     for p in "${SELECTED_PROFILES[@]}"; do
-        printf "║   %-15s: {host=\"%s\", job=\"%s\"}\n" "${p^}" "${HOST_NAME}" "${p}"
+        if [[ "${p}" == "arr" ]]; then
+            # Afficher les jobs réels détectés dynamiquement
+            if [[ ${#DETECTED_ARR_APPS[@]} -gt 0 ]]; then
+                for arr_app in "${DETECTED_ARR_APPS[@]}"; do
+                    printf "║   %-15s: {host=\"%s\", job=\"%s\"}\n" "${arr_app^}" "${HOST_NAME}" "${arr_app}"
+                done
+            else
+                printf "║   %-15s: (aucune app *arr détectée)\n" "Arr"
+            fi
+        elif [[ "${p}" == "nginx" ]]; then
+            printf "║   %-15s: {host=\"%s\", job=\"nginx\", log_type=\"access\"}\n" "Nginx access" "${HOST_NAME}"
+            printf "║   %-15s: {host=\"%s\", job=\"nginx\", log_type=\"error\"}\n" "Nginx error" "${HOST_NAME}"
+        elif [[ "${p}" == "unattended-upgrades" ]]; then
+            printf "║   %-15s: {host=\"%s\", job=\"%s\"}\n" "Unattended" "${HOST_NAME}" "unattended-upgrades"
+        else
+            printf "║   %-15s: {host=\"%s\", job=\"%s\"}\n" "${p^}" "${HOST_NAME}" "${p}"
+        fi
     done
 else
     echo -e "║ Mode          : DRY-RUN (aucune modification effectuée)"
