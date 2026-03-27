@@ -5,27 +5,31 @@ set -euo pipefail
 # install-promtail.sh — Installation et configuration de Promtail
 # Envoie les logs journald + fichiers applicatifs vers une instance Loki
 #
-# Usage interactif:
+# Usage (auto-détection des profils):
 #   curl -fsSL https://raw.githubusercontent.com/Tenta-dev/adminSys/main/install-promtail.sh \
 #     | bash -s -- --loki-url http://192.168.2.8:3100
 #
-# Usage automatisé (SaltStack, Ansible, etc.):
+# Usage avec profils explicites:
 #   bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles arr,nginx,syslog
+#
+# Usage journald uniquement:
+#   bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles none
 #
 # Options:
 #   --loki-url URL           URL de l'instance Loki (requis)
 #   --host NAME              Nom du host (défaut: hostname -s)
 #   --max-age AGE            Âge max des logs journald (défaut: 72h)
 #   --version VER            Version de Promtail à installer (défaut: latest)
-#   --profiles LIST          Profils de logs séparés par des virgules (skip le menu interactif)
+#   --profiles LIST          Profils de logs séparés par des virgules (skip l'auto-détection)
 #                            Profils: syslog, authlog, nginx, docker, arr, fail2ban, aide, rkhunter, unattended-upgrades
+#                            Spécial: "none" pour désactiver tous les profils (journald seul)
 #   --custom-path PATH       Chemin personnalisé à scraper (détection auto du format)
 #   --dry-run                Afficher les actions sans les exécuter
 #   --force-update-repo      Forcer apt-get update même si le repo existe
 #   --list-profiles          Lister les profils disponibles et quitter
 # ============================================================================
 
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.2.0"
 
 # --- Couleurs ---
 RED='\033[0;31m'
@@ -468,6 +472,23 @@ YAML
     esac
 }
 
+# --- Auto-détection de tous les profils présents ---
+autodetect_profiles() {
+    local detected=()
+    for profile in "${AVAILABLE_PROFILES[@]}"; do
+        if profile_detect "${profile}" 2>/dev/null; then
+            detected+=("${profile}")
+        fi
+    done
+    SELECTED_PROFILES=("${detected[@]}")
+
+    if [[ ${#SELECTED_PROFILES[@]} -gt 0 ]]; then
+        info "Profils auto-détectés : ${SELECTED_PROFILES[*]}"
+    else
+        info "Aucun profil détecté sur ce système — journald uniquement."
+    fi
+}
+
 # --- Menu interactif ---
 interactive_select_profiles() {
     local detected=()
@@ -586,8 +607,9 @@ Options:
   --host NAME              Nom du host (défaut: hostname -s)
   --max-age AGE            Âge max des logs journald (défaut: 72h)
   --version VER            Version de Promtail (défaut: latest)
-  --profiles LIST          Profils séparés par des virgules (mode non-interactif)
+  --profiles LIST          Profils séparés par des virgules (override auto-détection)
                            Disponibles : ${AVAILABLE_PROFILES[*]}
+                           "none" pour journald uniquement
   --custom-path PATH       Chemin custom à scraper (répétable)
   --dry-run                Afficher les actions sans les exécuter
   --force-update-repo      Forcer apt-get update
@@ -595,14 +617,17 @@ Options:
   -h, --help               Afficher cette aide
 
 Exemples:
-  # Interactif (menu de sélection)
+  # Auto-détection (curl | bash ou terminal)
   bash install-promtail.sh --loki-url http://192.168.2.8:3100
 
-  # Automatisé (SaltStack, Ansible)
+  # Profils explicites (override auto-détection)
   bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles arr,syslog,fail2ban
 
+  # Journald uniquement
+  bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles none
+
   # Avec chemin custom
-  bash install-promtail.sh --loki-url http://192.168.2.8:3100 --profiles nginx \\
+  bash install-promtail.sh --loki-url http://192.168.2.8:3100 \\
     --custom-path /opt/myapp/logs/*.log
 HELP
             exit 0
@@ -662,7 +687,9 @@ esac
 # --- Sélection des profils ---
 SELECTED_PROFILES=()
 
-if [[ -n "${PROFILES_CLI}" ]]; then
+if [[ "${PROFILES_CLI}" == "none" ]]; then
+    info "Profils désactivés (--profiles none) — journald uniquement."
+elif [[ -n "${PROFILES_CLI}" ]]; then
     IFS=',' read -ra SELECTED_PROFILES <<< "${PROFILES_CLI}"
     for p in "${SELECTED_PROFILES[@]}"; do
         if [[ -z "${PROFILE_DESC[${p}]+_}" ]]; then
@@ -671,13 +698,13 @@ if [[ -n "${PROFILES_CLI}" ]]; then
     done
     info "Profils sélectionnés (CLI) : ${SELECTED_PROFILES[*]}"
 else
-    # Mode interactif uniquement si stdin est un terminal
-    # (pas de pipe via curl | bash)
     if [[ -t 0 ]]; then
+        # Terminal interactif → menu de sélection
         interactive_select_profiles
     else
-        info "Stdin non-interactif et --profiles non spécifié : journald uniquement."
-        info "Pour ajouter des profils via pipe : ajoutez --profiles arr,syslog,..."
+        # Non-interactif (curl | bash, SaltStack, etc.) → auto-détection
+        info "Auto-détection des profils..."
+        autodetect_profiles
     fi
 fi
 
