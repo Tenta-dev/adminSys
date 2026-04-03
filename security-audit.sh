@@ -22,7 +22,7 @@ set -euo pipefail
 # CONFIGURATION
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly REPORT_DIR="${REPORT_DIR:-/root/security-reports}"
 readonly HARDENING_STAMP="/etc/hardening-version"
 

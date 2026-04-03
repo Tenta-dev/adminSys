@@ -30,7 +30,7 @@ set -euo pipefail
 # CONSTANTES & CONFIGURATION PAR DÉFAUT
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly LOG_FILE="/var/log/post-install-hardening.log"
 readonly SYSCTL_HARDENING_FILE="/etc/sysctl.d/99-hardening.conf"
 readonly SSH_CONFIG="/etc/ssh/sshd_config"
@@ -376,7 +376,20 @@ module_harden_ssh() {
     # Créer le répertoire sshd_config.d s'il n'existe pas
     run mkdir -p "${SSH_HARDENING_DIR}"
 
-    local hardening_conf="${SSH_HARDENING_DIR}/99-hardening.conf"
+    # Supprimer les configs qui overrident notre hardening (cloud-init, etc.)
+    # cloud-init génère 50-cloud-init.conf avec PasswordAuthentication yes
+    for override_conf in "${SSH_HARDENING_DIR}"/50-cloud-init.conf; do
+        if [[ -f "${override_conf}" ]]; then
+            info "Suppression de ${override_conf} (override SSH incompatible avec le hardening)"
+            run rm -f "${override_conf}"
+        fi
+    done
+
+    # 01- pour garantir la priorité sur tout futur fichier dans sshd_config.d
+    local hardening_conf="${SSH_HARDENING_DIR}/01-hardening.conf"
+
+    # Nettoyer l'ancien fichier si présent (migration v2.0 → v2.1)
+    [[ -f "${SSH_HARDENING_DIR}/99-hardening.conf" ]] && run rm -f "${SSH_HARDENING_DIR}/99-hardening.conf"
 
     # FIX #6 : écriture conditionnelle (respecte --dry-run)
     {
@@ -592,7 +605,7 @@ module_harden_sysctl() {
     {
         cat << 'SYSCTLEOF'
 # =============================================================================
-# Hardening sysctl — post-install-hardening.sh v2.1
+# Hardening sysctl — post-install-hardening.sh v2.2
 # =============================================================================
 
 # --- Protection réseau ---
@@ -915,8 +928,13 @@ module_apparmor() {
     fi
 
     # Installer AppArmor s'il n'est pas présent
-    if ! command -v apparmor_status &>/dev/null && ! command -v aa-status &>/dev/null; then
-        run apt-get install -y -qq apparmor apparmor-utils
+    if ! command -v aa-status &>/dev/null && ! command -v apparmor_status &>/dev/null; then
+        run apt-get install -y -qq apparmor
+    fi
+
+    # Installer apparmor-utils séparément (fournit aa-enforce, aa-complain, etc.)
+    if ! command -v aa-enforce &>/dev/null; then
+        run apt-get install -y -qq apparmor-utils
     fi
 
     # S'assurer qu'AppArmor est activé et en enforce
@@ -924,14 +942,34 @@ module_apparmor() {
         run systemctl enable apparmor
         run systemctl start apparmor
 
-        # Mettre tous les profils en mode enforce
+        # Passer les profils complain en enforce (uniquement ceux déjà chargés)
         if command -v aa-enforce &>/dev/null; then
-            aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+            local complain_profiles
+            complain_profiles=$(aa-status 2>/dev/null | awk '/profiles are in complain mode/{found=1; next} found && /^   /{print; next} found{exit}' || true)
+            if [[ -n "${complain_profiles}" ]]; then
+                while IFS= read -r profile; do
+                    profile=$(echo "${profile}" | xargs)  # trim
+                    [[ -z "${profile}" ]] && continue
+                    # Chercher le fichier profil correspondant
+                    local profile_file
+                    profile_file=$(find /etc/apparmor.d -maxdepth 1 -type f -name "*${profile}*" 2>/dev/null | head -1)
+                    if [[ -n "${profile_file}" ]]; then
+                        aa-enforce "${profile_file}" 2>/dev/null && \
+                            info "Profil AppArmor passé en enforce : ${profile}" || true
+                    fi
+                done <<< "${complain_profiles}"
+            fi
         fi
 
         local profiles_enforced
         profiles_enforced=$(aa-status 2>/dev/null | grep "profiles are in enforce mode" | awk '{print $1}' || echo "0")
-        success "AppArmor actif — ${profiles_enforced} profil(s) en mode enforce."
+        local profiles_complain
+        profiles_complain=$(aa-status 2>/dev/null | grep "profiles are in complain mode" | awk '{print $1}' || echo "0")
+        if [[ "${profiles_complain}" -gt 0 ]]; then
+            warn "AppArmor actif — ${profiles_enforced} enforce, ${profiles_complain} encore en complain"
+        else
+            success "AppArmor actif — ${profiles_enforced} profil(s) en mode enforce."
+        fi
     else
         success "[DRY-RUN] AppArmor configuré."
     fi
@@ -1058,7 +1096,7 @@ AIDEEOF
     local passwdqc_conf="/etc/security/passwdqc.conf"
     if dpkg -l libpam-passwdqc 2>/dev/null | grep -q "^ii"; then
         cat << 'PWQCEOF' | write_file "${passwdqc_conf}"
-# Configuration passwdqc — post-install-hardening.sh v2.1
+# Configuration passwdqc — post-install-hardening.sh v2.2
 # Format min=disabled,disabled,disabled,8,8 :
 #   N0 = mots de passe à 1 classe de caractères (désactivé)
 #   N1 = mots de passe à 2 classes (désactivé)
@@ -1229,7 +1267,7 @@ module_auditd_rules() {
 
     cat << 'AUDITEOF' | write_file "${rules_file}"
 # =============================================================================
-# Règles auditd — post-install-hardening.sh v2.1
+# Règles auditd — post-install-hardening.sh v2.2
 # Basées sur les recommandations CIS et STIG
 # =============================================================================
 
