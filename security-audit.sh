@@ -22,7 +22,7 @@ set -euo pipefail
 # CONFIGURATION
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly REPORT_DIR="${REPORT_DIR:-/root/security-reports}"
 readonly HARDENING_STAMP="/etc/hardening-version"
 
@@ -156,13 +156,32 @@ audit_system_info() {
     else
         echo -e "  Hardening   : ${YELLOW}aucun stamp trouvé${NC}"
     fi
+
+    # FIX #8 : Check QEMU Guest Agent sur les VMs KVM
+    if [[ "${CONTAINER_TYPE}" == "kvm" ]]; then
+        if systemctl is-active qemu-guest-agent &>/dev/null; then
+            result_ok "QEMU Guest Agent actif"
+        elif dpkg -l qemu-guest-agent &>/dev/null 2>&1; then
+            result_warn "QEMU Guest Agent installé mais inactif"
+        else
+            result_crit "QEMU Guest Agent non installé (snapshots Proxmox dégradés)"
+        fi
+    fi
 }
 
 # --- 2. Mises à jour de sécurité en attente ---
 audit_pending_updates() {
     print_section "Mises à jour de sécurité"
 
-    apt-get update -qq 2>/dev/null || true
+    # FIX #9 : ne pas forcer apt update — vérifier l'âge du cache
+    local cache_age_hours=999
+    if [[ -f /var/cache/apt/pkgcache.bin ]]; then
+        cache_age_hours=$(( ($(date +%s) - $(stat -c %Y /var/cache/apt/pkgcache.bin)) / 3600 ))
+    fi
+
+    if [[ "${cache_age_hours}" -gt 24 ]]; then
+        result_info "Cache APT ancien (${cache_age_hours}h) — résultats potentiellement incomplets"
+    fi
 
     local all_updates=0
     local security_updates=0
@@ -505,7 +524,6 @@ audit_ntp() {
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         result_info "Environnement LXC — NTP géré par le host Proxmox"
 
-        # Vérifier quand même si l'horloge semble raisonnable
         local timedatectl_synced
         timedatectl_synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "")
         if [[ "${timedatectl_synced}" == "yes" ]]; then
@@ -552,7 +570,6 @@ audit_ntp() {
 audit_apparmor() {
     print_section "AppArmor"
 
-    # En LXC, AppArmor est géré par le host
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         result_info "Environnement LXC — AppArmor géré par le host"
         return
@@ -610,9 +627,10 @@ audit_auditd() {
         return
     fi
 
-    # Vérifier le nombre de règles chargées
+    # FIX #1 : correction du bug grep -cv qui produisait "0\n0"
+    # grep -v filtre les lignes "No rules", wc -l compte le reste
     local rule_count
-    rule_count=$(auditctl -l 2>/dev/null | grep -cv "^No rules" || echo "0")
+    rule_count=$(auditctl -l 2>/dev/null | grep -v "^No rules" | wc -l)
 
     if [[ "${rule_count}" -gt 0 ]]; then
         result_ok "${rule_count} règle(s) auditd chargée(s)"
@@ -657,7 +675,6 @@ audit_aide() {
     if [[ -f /var/lib/aide/aide.db ]]; then
         result_ok "Base AIDE initialisée"
 
-        # Vérifier la fraîcheur de la base
         local db_age_days
         db_age_days=$(( ($(date +%s) - $(stat -c %Y /var/lib/aide/aide.db 2>/dev/null || echo "0")) / 86400 ))
 
@@ -732,14 +749,11 @@ audit_secure_mounts() {
 audit_core_dumps() {
     print_section "Core dumps"
 
-    local core_disabled=true
-
     # Vérifier limits.conf
     if grep -rq "hard core 0" /etc/security/limits.conf /etc/security/limits.d/ 2>/dev/null; then
         result_ok "Core dumps désactivés (limits.conf)"
     else
         result_warn "Core dumps non désactivés dans limits.conf"
-        core_disabled=false
     fi
 
     # Vérifier sysctl fs.suid_dumpable
@@ -749,7 +763,6 @@ audit_core_dumps() {
         result_ok "fs.suid_dumpable = 0"
     elif [[ -n "${suid_dump}" ]]; then
         result_warn "fs.suid_dumpable = ${suid_dump} (devrait être 0)"
-        core_disabled=false
     fi
 
     # Vérifier systemd-coredump
@@ -791,7 +804,6 @@ audit_backups() {
 
     local backup_found=false
 
-    # Vérifier les emplacements communs de backup
     local backup_dirs=(
         /var/backups
         /root/backups
@@ -801,7 +813,6 @@ audit_backups() {
 
     for dir in "${backup_dirs[@]}"; do
         if [[ -d "${dir}" ]]; then
-            # Chercher des fichiers récents (< 7 jours)
             local recent_count
             recent_count=$(find "${dir}" -type f -mtime -7 2>/dev/null | wc -l || echo "0")
             local total_count
@@ -811,7 +822,6 @@ audit_backups() {
                 result_ok "${dir} — ${recent_count} fichier(s) récent(s) (< 7j), ${total_count} total"
                 backup_found=true
             elif [[ "${total_count}" -gt 0 ]]; then
-                # Trouver le fichier le plus récent
                 local newest
                 newest=$(find "${dir}" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | awk '{print $2}')
                 local newest_age
@@ -1239,11 +1249,11 @@ ${BOLD}OPTIONS${NC}
     --discord               Envoyer le rapport par Discord (webhook)
     --export <dir>          Exporter le rapport en Markdown
     --summary-only          Afficher uniquement le résumé
-    --help                  Afficher cette aide
+    -h, --help              Afficher cette aide
 
 ${BOLD}MODULES D'AUDIT${NC}
-     1. Informations système + stamp hardening
-     2. Mises à jour de sécurité
+     1. Informations système + stamp hardening + QEMU Guest Agent
+     2. Mises à jour de sécurité (sans apt update forcé)
      3. Configuration SSH
      4. Fail2ban
      5. Ports ouverts
@@ -1289,7 +1299,7 @@ parse_args() {
             --discord)       ENABLE_DISCORD=true;   shift ;;
             --export)        EXPORT_DIR="$2";       shift 2 ;;
             --summary-only)  SUMMARY_ONLY=true;     shift ;;
-            --help|-h)       show_help ;;
+            -h|--help)       show_help ;;
             *) echo -e "${RED}Option inconnue : $1${NC}"; show_help ;;
         esac
     done

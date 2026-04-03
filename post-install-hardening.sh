@@ -11,13 +11,15 @@
 #   -u, --username <user>       Nom de l'utilisateur admin à créer (défaut: admin)
 #   -k, --ssh-key <path|url>    Chemin ou URL de la clé publique SSH
 #   -p, --ssh-port <port>       Port SSH personnalisé (défaut: 22)
-#   -h, --hostname <name>       Nom d'hôte à configurer
+#   -n, --name <hostname>       Nom d'hôte à configurer
 #   -d, --discord               Activer la notification Discord (webhook)
+#   --nopasswd-sudo             Autoriser sudo sans mot de passe (déconseillé)
+#   --enable-forwarding         Ne pas désactiver ip_forward (VPN/routeur)
 #   --no-fail2ban               Ne pas installer fail2ban
 #   --no-ufw                    Ne pas configurer UFW
 #   --no-unattended             Ne pas configurer unattended-upgrades
 #   --dry-run                   Afficher les actions sans les exécuter
-#   --help                      Afficher l'aide
+#   -h, --help                  Afficher l'aide
 #
 # Auteur : AdminSys_Linux
 # Licence : MIT
@@ -28,7 +30,7 @@ set -euo pipefail
 # CONSTANTES & CONFIGURATION PAR DÉFAUT
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly LOG_FILE="/var/log/post-install-hardening.log"
 readonly SYSCTL_HARDENING_FILE="/etc/sysctl.d/99-hardening.conf"
 readonly SSH_CONFIG="/etc/ssh/sshd_config"
@@ -51,6 +53,8 @@ ENABLE_FAIL2BAN=true
 ENABLE_UFW=true
 ENABLE_UNATTENDED=true
 ENABLE_DISCORD=false
+ENABLE_FORWARDING=false
+NOPASSWD_SUDO=false
 DRY_RUN=false
 
 # Discord webhook (à configurer si besoin)
@@ -79,11 +83,35 @@ die() {
     exit 1
 }
 
+# FIX #2 : run() sans eval — exécution directe, sûre
 run() {
     if [[ "${DRY_RUN}" == true ]]; then
         info "[DRY-RUN] $*"
+        return 0
+    fi
+    "$@"
+}
+
+# Écriture conditionnelle de fichiers (respecte --dry-run)
+# Usage : write_file <dest> <<'EOF' ... EOF
+write_file() {
+    local dest="$1"
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Écriture de ${dest}"
+        cat > /dev/null  # consomme stdin sans rien faire
     else
-        eval "$@"
+        cat > "${dest}"
+    fi
+}
+
+# Écriture conditionnelle avec append
+append_file() {
+    local dest="$1"
+    if [[ "${DRY_RUN}" == true ]]; then
+        info "[DRY-RUN] Append dans ${dest}"
+        cat > /dev/null
+    else
+        cat >> "${dest}"
     fi
 }
 
@@ -107,8 +135,6 @@ detect_os() {
     case "${OS_ID}" in
         debian|ubuntu)
             PKG_MANAGER="apt-get"
-            PKG_UPDATE="${PKG_MANAGER} update -qq"
-            PKG_INSTALL="${PKG_MANAGER} install -y -qq"
             ;;
         *)
             die "OS non supporté : ${OS_ID}. Seuls Debian et Ubuntu sont supportés."
@@ -142,13 +168,15 @@ Options :
   -u, --username <user>       Utilisateur admin à créer (défaut: admin)
   -k, --ssh-key <path|url>    Clé publique SSH (fichier local ou URL)
   -p, --ssh-port <port>       Port SSH (défaut: 22)
-  -h, --hostname <name>       Nom d'hôte à configurer
+  -n, --name <hostname>       Nom d'hôte à configurer
   -d, --discord               Notification Discord (webhook) à la fin
+  --nopasswd-sudo             Autoriser sudo sans mot de passe (déconseillé)
+  --enable-forwarding         Ne pas désactiver ip_forward (nécessaire pour VPN/routeur)
   --no-fail2ban               Désactiver l'installation de fail2ban
   --no-ufw                    Désactiver la configuration UFW
   --no-unattended             Désactiver unattended-upgrades
   --dry-run                   Mode simulation (aucune modification)
-  --help                      Afficher cette aide
+  -h, --help                  Afficher cette aide
 
 Modules appliqués :
    1. Mise à jour système + paquets essentiels
@@ -168,8 +196,8 @@ Modules appliqués :
   15. Montages sécurisés (/tmp, /dev/shm)
   16. Hidepid /proc (VMs uniquement)
   17. AppArmor enforcement
-  18. Règles auditd (VMs uniquement)
-  19. Hardening avancé Lynis (rkhunter, bannière, login.defs, modprobe, permissions, passwdqc)
+  18. Hardening avancé Lynis (rkhunter, bannière, login.defs, modprobe, permissions, passwdqc)
+  19. Règles auditd (VMs uniquement) — après installation dans le module avancé
   20. Stamp de version
 
 Exemples :
@@ -178,6 +206,9 @@ Exemples :
 
   # Hardening minimal sans firewall
   ${SCRIPT_NAME} -u admin -k https://github.com/monuser.keys --no-ufw
+
+  # VM VPN/routeur (garde ip_forward actif)
+  ${SCRIPT_NAME} -u admin -k ~/.ssh/id_ed25519.pub --enable-forwarding
 
   # Simulation
   ${SCRIPT_NAME} --dry-run -u admin
@@ -189,19 +220,22 @@ EOF
 # PARSING DES ARGUMENTS
 # =============================================================================
 
+# FIX #7 : -h = help, -n = hostname
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -u|--username)    ADMIN_USER="$2";    shift 2 ;;
-            -k|--ssh-key)     SSH_KEY="$2";       shift 2 ;;
-            -p|--ssh-port)    SSH_PORT="$2";      shift 2 ;;
-            -h|--hostname)    NEW_HOSTNAME="$2";  shift 2 ;;
-            -d|--discord)     ENABLE_DISCORD=true; shift ;;
-            --no-fail2ban)    ENABLE_FAIL2BAN=false; shift ;;
-            --no-ufw)        ENABLE_UFW=false;   shift ;;
-            --no-unattended)  ENABLE_UNATTENDED=false; shift ;;
-            --dry-run)        DRY_RUN=true;       shift ;;
-            --help)           show_help ;;
+            -u|--username)          ADMIN_USER="$2";         shift 2 ;;
+            -k|--ssh-key)           SSH_KEY="$2";            shift 2 ;;
+            -p|--ssh-port)          SSH_PORT="$2";           shift 2 ;;
+            -n|--name)              NEW_HOSTNAME="$2";       shift 2 ;;
+            -d|--discord)           ENABLE_DISCORD=true;     shift ;;
+            --nopasswd-sudo)        NOPASSWD_SUDO=true;      shift ;;
+            --enable-forwarding)    ENABLE_FORWARDING=true;  shift ;;
+            --no-fail2ban)          ENABLE_FAIL2BAN=false;   shift ;;
+            --no-ufw)              ENABLE_UFW=false;         shift ;;
+            --no-unattended)        ENABLE_UNATTENDED=false; shift ;;
+            --dry-run)              DRY_RUN=true;            shift ;;
+            -h|--help)              show_help ;;
             *) die "Option inconnue : $1. Utilisez --help pour l'aide." ;;
         esac
     done
@@ -214,8 +248,8 @@ parse_args() {
 # --- 1. Mise à jour système ---
 module_system_update() {
     info "━━━ Module 1/20 : Mise à jour du système ━━━"
-    run "${PKG_UPDATE}"
-    run "${PKG_MANAGER} upgrade -y -qq"
+    run apt-get update -qq
+    run apt-get upgrade -y -qq
     success "Système mis à jour."
 }
 
@@ -235,7 +269,7 @@ module_install_essentials() {
         lynis
     )
 
-    run "${PKG_INSTALL} ${packages[*]}"
+    run apt-get install -y -qq "${packages[@]}"
     success "Paquets essentiels installés."
 }
 
@@ -243,11 +277,11 @@ module_install_essentials() {
 module_set_hostname() {
     if [[ -n "${NEW_HOSTNAME}" ]]; then
         info "━━━ Module 3/20 : Configuration du hostname : ${NEW_HOSTNAME} ━━━"
-        run "hostnamectl set-hostname '${NEW_HOSTNAME}'"
+        run hostnamectl set-hostname "${NEW_HOSTNAME}"
 
         # Mise à jour /etc/hosts
         if ! grep -q "${NEW_HOSTNAME}" /etc/hosts 2>/dev/null; then
-            run "echo '127.0.1.1 ${NEW_HOSTNAME}' >> /etc/hosts"
+            echo "127.0.1.1 ${NEW_HOSTNAME}" | append_file /etc/hosts
         fi
 
         success "Hostname configuré : ${NEW_HOSTNAME}"
@@ -261,15 +295,20 @@ module_create_admin_user() {
     if id "${ADMIN_USER}" &>/dev/null; then
         warn "L'utilisateur ${ADMIN_USER} existe déjà, mise à jour de la configuration."
     else
-        run "useradd -m -s /bin/bash -G sudo '${ADMIN_USER}'"
+        run useradd -m -s /bin/bash -G sudo "${ADMIN_USER}"
         # Verrouillage du mot de passe (auth par clé uniquement)
-        run "passwd -l '${ADMIN_USER}'"
+        run passwd -l "${ADMIN_USER}"
         success "Utilisateur ${ADMIN_USER} créé et ajouté au groupe sudo."
     fi
 
-    # Sudo sans mot de passe (l'auth se fait par clé SSH)
-    run "echo '${ADMIN_USER} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/${ADMIN_USER}"
-    run "chmod 440 /etc/sudoers.d/${ADMIN_USER}"
+    # FIX #4 : NOPASSWD configurable (désactivé par défaut)
+    if [[ "${NOPASSWD_SUDO}" == true ]]; then
+        warn "NOPASSWD activé pour ${ADMIN_USER} (option --nopasswd-sudo). Déconseillé en production."
+        echo "${ADMIN_USER} ALL=(ALL) NOPASSWD:ALL" | write_file "/etc/sudoers.d/${ADMIN_USER}"
+    else
+        echo "${ADMIN_USER} ALL=(ALL) ALL" | write_file "/etc/sudoers.d/${ADMIN_USER}"
+    fi
+    run chmod 440 "/etc/sudoers.d/${ADMIN_USER}"
 
     # Déploiement de la clé SSH
     if [[ -n "${SSH_KEY}" ]]; then
@@ -278,7 +317,7 @@ module_create_admin_user() {
         local tmp_keys
         tmp_keys=$(mktemp)
 
-        run "mkdir -p '${ssh_dir}'"
+        run mkdir -p "${ssh_dir}"
 
         # Récupérer les clés depuis la source
         if [[ "${SSH_KEY}" =~ ^https?:// ]]; then
@@ -316,9 +355,9 @@ module_create_admin_user() {
 
         rm -f "${tmp_keys}"
 
-        run "chmod 700 '${ssh_dir}'"
-        run "chmod 600 '${auth_keys}'"
-        run "chown -R '${ADMIN_USER}:${ADMIN_USER}' '${ssh_dir}'"
+        run chmod 700 "${ssh_dir}"
+        run chmod 600 "${auth_keys}"
+        run chown -R "${ADMIN_USER}:${ADMIN_USER}" "${ssh_dir}"
 
         if [[ "${added}" -gt 0 ]]; then
             success "Clé(s) SSH déployée(s) pour ${ADMIN_USER} (${added} ajoutée(s), ${skipped} déjà présente(s))."
@@ -335,11 +374,13 @@ module_harden_ssh() {
     info "━━━ Module 5/20 : Hardening SSH ━━━"
 
     # Créer le répertoire sshd_config.d s'il n'existe pas
-    run "mkdir -p '${SSH_HARDENING_DIR}'"
+    run mkdir -p "${SSH_HARDENING_DIR}"
 
     local hardening_conf="${SSH_HARDENING_DIR}/99-hardening.conf"
 
-    cat > /tmp/ssh-hardening.conf << 'SSHEOF'
+    # FIX #6 : écriture conditionnelle (respecte --dry-run)
+    {
+        cat << 'SSHEOF'
 # =============================================================================
 # Hardening SSH — généré par post-install-hardening.sh
 # =============================================================================
@@ -372,33 +413,34 @@ LogLevel VERBOSE
 Banner /etc/issue.net
 SSHEOF
 
-    # Ajout du port personnalisé
-    if [[ "${SSH_PORT}" != "22" ]]; then
-        echo "Port ${SSH_PORT}" >> /tmp/ssh-hardening.conf
+        # Ajout du port personnalisé
+        if [[ "${SSH_PORT}" != "22" ]]; then
+            echo "Port ${SSH_PORT}"
+        fi
+
+        # Restreindre l'accès à l'utilisateur admin
+        echo "AllowUsers ${ADMIN_USER}"
+    } | write_file "${hardening_conf}"
+
+    if [[ "${DRY_RUN}" == false ]]; then
+        chmod 644 "${hardening_conf}"
     fi
 
-    # Restreindre l'accès à l'utilisateur admin
-    echo "AllowUsers ${ADMIN_USER}" >> /tmp/ssh-hardening.conf
-
-    run "cp /tmp/ssh-hardening.conf '${hardening_conf}'"
-    run "chmod 644 '${hardening_conf}'"
-    rm -f /tmp/ssh-hardening.conf
-
     # Créer /run/sshd si absent (nécessaire sur les LXC minimalistes)
-    run "mkdir -p /run/sshd"
+    run mkdir -p /run/sshd
 
     # Ubuntu 24.04+ utilise ssh.socket (activation par socket systemd)
     if systemctl is-active ssh.socket &>/dev/null || systemctl is-enabled ssh.socket &>/dev/null; then
         info "ssh.socket détecté (Ubuntu 24.04+). Bascule vers ssh.service..."
-        run "systemctl disable --now ssh.socket"
-        run "systemctl enable ssh.service"
+        run systemctl disable --now ssh.socket
+        run systemctl enable ssh.service
     fi
 
     # Vérification de la config SSH avant redémarrage
     if [[ "${DRY_RUN}" == false ]]; then
         local sshd_errors
         if sshd_errors="$(sshd -t 2>&1)"; then
-            run "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true"
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
             success "SSH hardened et redémarré (port ${SSH_PORT})."
         else
             error "La configuration SSH est invalide ! Rollback..."
@@ -429,9 +471,9 @@ module_install_fail2ban() {
     fi
 
     info "━━━ Module 6/20 : Installation et configuration de fail2ban ━━━"
-    run "${PKG_INSTALL} fail2ban"
+    run apt-get install -y -qq fail2ban
 
-    cat > /tmp/fail2ban-jail.local << JAILEOF
+    cat << JAILEOF | write_file /etc/fail2ban/jail.local
 # fail2ban — configuration post-install-hardening.sh
 [DEFAULT]
 bantime  = 1h
@@ -450,12 +492,12 @@ backend  = systemd
 maxretry = 3
 JAILEOF
 
-    run "cp /tmp/fail2ban-jail.local /etc/fail2ban/jail.local"
-    run "chmod 644 /etc/fail2ban/jail.local"
-    rm -f /tmp/fail2ban-jail.local
+    if [[ "${DRY_RUN}" == false ]]; then
+        chmod 644 /etc/fail2ban/jail.local
+    fi
 
-    run "systemctl enable fail2ban"
-    run "systemctl restart fail2ban"
+    run systemctl enable fail2ban
+    run systemctl restart fail2ban
     success "Fail2ban installé et configuré (SSH port ${SSH_PORT})."
 }
 
@@ -473,14 +515,14 @@ module_configure_ufw() {
     fi
 
     info "━━━ Module 7/20 : Configuration du firewall UFW ━━━"
-    run "${PKG_INSTALL} ufw"
+    run apt-get install -y -qq ufw
 
     # Politique par défaut
-    run "ufw default deny incoming"
-    run "ufw default allow outgoing"
+    run ufw default deny incoming
+    run ufw default allow outgoing
 
     # Autoriser SSH
-    run "ufw allow ${SSH_PORT}/tcp comment 'SSH'"
+    run ufw allow "${SSH_PORT}/tcp" comment 'SSH'
 
     # Activer UFW
     if [[ "${DRY_RUN}" == false ]]; then
@@ -501,9 +543,9 @@ module_configure_unattended_upgrades() {
     fi
 
     info "━━━ Module 8/20 : Configuration des mises à jour automatiques de sécurité ━━━"
-    run "${PKG_INSTALL} unattended-upgrades apt-listchanges"
+    run apt-get install -y -qq unattended-upgrades apt-listchanges
 
-    cat > /tmp/50unattended-upgrades << 'UUEOF'
+    cat << 'UUEOF' | write_file /etc/apt/apt.conf.d/50unattended-upgrades
 // Unattended-Upgrades — post-install-hardening.sh
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -526,18 +568,12 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::SyslogEnable "true";
 UUEOF
 
-    run "cp /tmp/50unattended-upgrades /etc/apt/apt.conf.d/50unattended-upgrades"
-    rm -f /tmp/50unattended-upgrades
-
-    cat > /tmp/20auto-upgrades << 'AUEOF'
+    cat << 'AUEOF' | write_file /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 AUEOF
-
-    run "cp /tmp/20auto-upgrades /etc/apt/apt.conf.d/20auto-upgrades"
-    rm -f /tmp/20auto-upgrades
 
     success "Mises à jour de sécurité automatiques activées (reboot auto à 04:00 si nécessaire)."
 }
@@ -552,14 +588,14 @@ module_harden_sysctl() {
         return
     fi
 
-    cat > /tmp/99-hardening.conf << 'SYSCTLEOF'
+    # FIX #5 : ip_forward conditionnel pour VPN/routeur
+    {
+        cat << 'SYSCTLEOF'
 # =============================================================================
-# Hardening sysctl — post-install-hardening.sh v2
+# Hardening sysctl — post-install-hardening.sh v2.1
 # =============================================================================
 
 # --- Protection réseau ---
-net.ipv4.ip_forward = 0
-net.ipv6.conf.all.forwarding = 0
 
 # SYN flood
 net.ipv4.tcp_syncookies = 1
@@ -606,8 +642,24 @@ net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 SYSCTLEOF
 
-    run "cp /tmp/99-hardening.conf '${SYSCTL_HARDENING_FILE}'"
-    rm -f /tmp/99-hardening.conf
+        # ip_forward : conditionnel selon l'option --enable-forwarding
+        if [[ "${ENABLE_FORWARDING}" == true ]]; then
+            cat << 'FWDEOF'
+
+# --- IP Forwarding (activé via --enable-forwarding pour VPN/routeur) ---
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+FWDEOF
+            warn "ip_forward ACTIVÉ (option --enable-forwarding). Nécessaire pour VPN/routeur."
+        else
+            cat << 'NOFWDEOF'
+
+# --- IP Forwarding (désactivé — utiliser --enable-forwarding pour VPN/routeur) ---
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+NOFWDEOF
+        fi
+    } | write_file "${SYSCTL_HARDENING_FILE}"
 
     if [[ "${DRY_RUN}" == false ]]; then
         sysctl --system > /dev/null 2>&1
@@ -629,7 +681,7 @@ module_disable_unnecessary_services() {
 
     for service in "${services_to_disable[@]}"; do
         if systemctl is-enabled "${service}" &>/dev/null 2>&1; then
-            run "systemctl disable --now '${service}'"
+            run systemctl disable --now "${service}"
             info "Service désactivé : ${service}"
         fi
     done
@@ -641,19 +693,16 @@ module_disable_unnecessary_services() {
 module_configure_logging() {
     info "━━━ Module 11/20 : Configuration du logging ━━━"
 
-    run "mkdir -p /etc/systemd/journald.conf.d"
+    run mkdir -p /etc/systemd/journald.conf.d
 
-    cat > /tmp/size-limit.conf << 'LOGEOF'
+    cat << 'LOGEOF' | write_file /etc/systemd/journald.conf.d/size-limit.conf
 [Journal]
 SystemMaxUse=200M
 MaxRetentionSec=1month
 Compress=yes
 LOGEOF
 
-    run "cp /tmp/size-limit.conf /etc/systemd/journald.conf.d/size-limit.conf"
-    rm -f /tmp/size-limit.conf
-
-    run "systemctl restart systemd-journald"
+    run systemctl restart systemd-journald
     success "Journald configuré (max 200M, rétention 1 mois)."
 }
 
@@ -662,23 +711,20 @@ module_configure_ntp() {
     info "━━━ Module 12/20 : Synchronisation NTP ━━━"
 
     # En LXC, le kernel est partagé avec le host : adjtimex() est bloqué.
-    # Ni chrony ni systemd-timesyncd ne peuvent ajuster l'horloge.
-    # La synchronisation NTP est gérée par le host Proxmox.
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         warn "Environnement LXC : NTP géré par le host Proxmox (adjtimex non autorisé). Module ignoré."
         return
     fi
 
-    # Sur VM/bare-metal : installer chrony (plus précis, recommandé par Lynis)
-    run "${PKG_INSTALL} chrony"
+    run apt-get install -y -qq chrony
 
     # Désactiver systemd-timesyncd s'il est actif (conflit avec chrony)
     if systemctl is-active systemd-timesyncd &>/dev/null; then
-        run "systemctl disable --now systemd-timesyncd"
+        run systemctl disable --now systemd-timesyncd
     fi
 
-    run "systemctl enable chrony"
-    run "systemctl restart chrony"
+    run systemctl enable chrony
+    run systemctl restart chrony
 
     # Vérifier la synchronisation
     if [[ "${DRY_RUN}" == false ]]; then
@@ -726,15 +772,14 @@ module_shell_timeout() {
 
     local tmout_file="/etc/profile.d/99-tmout.sh"
 
-    if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] Création ${tmout_file} (TMOUT=900)"
-    else
-        cat > "${tmout_file}" << 'TMEOF'
+    cat << 'TMEOF' | write_file "${tmout_file}"
 # Timeout shell — généré par post-install-hardening.sh
 # Déconnexion automatique après 15 minutes d'inactivité
 readonly TMOUT=900
 export TMOUT
 TMEOF
+
+    if [[ "${DRY_RUN}" == false ]]; then
         chmod 644 "${tmout_file}"
     fi
 
@@ -747,31 +792,30 @@ module_disable_core_dumps() {
 
     local limits_file="/etc/security/limits.d/99-no-core.conf"
 
-    if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] Création ${limits_file}"
-    else
-        cat > "${limits_file}" << 'COREEOF'
+    cat << 'COREEOF' | write_file "${limits_file}"
 # Désactivation core dumps — post-install-hardening.sh
 * hard core 0
 * soft core 0
 COREEOF
+
+    if [[ "${DRY_RUN}" == false ]]; then
         chmod 644 "${limits_file}"
     fi
 
     # Désactiver aussi dans systemd (coredump service)
     local coredump_conf="/etc/systemd/coredump.conf.d"
-    if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] Configuration systemd-coredump"
-    else
+
+    if [[ "${DRY_RUN}" == false ]]; then
         mkdir -p "${coredump_conf}"
         cat > "${coredump_conf}/disable.conf" << 'SDCEOF'
 [Coredump]
 Storage=none
 ProcessSizeMax=0
 SDCEOF
+    else
+        info "[DRY-RUN] Configuration systemd-coredump"
     fi
 
-    # fs.suid_dumpable est déjà dans le sysctl (module 9)
     success "Core dumps désactivés (limits.conf + systemd-coredump + sysctl)."
 }
 
@@ -795,7 +839,6 @@ module_secure_mounts() {
 
     # /dev/shm — ajouter noexec,nosuid,nodev si pas déjà configuré
     if grep -q '/dev/shm' "${fstab}"; then
-        # Vérifier si les options sont déjà présentes
         if ! grep '/dev/shm' "${fstab}" | grep -q 'noexec'; then
             sed -i '/\/dev\/shm/s/defaults/defaults,noexec,nosuid,nodev/' "${fstab}"
             changed=true
@@ -812,13 +855,11 @@ module_secure_mounts() {
             changed=true
         fi
     else
-        # Monter /tmp en tmpfs avec les bonnes options
         echo "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev,size=512M 0 0" >> "${fstab}"
         changed=true
     fi
 
     if [[ "${changed}" == true ]]; then
-        # Remonter immédiatement
         mount -o remount /dev/shm 2>/dev/null || true
         mount -o remount /tmp 2>/dev/null || true
         success "Montages /tmp et /dev/shm sécurisés (noexec,nosuid,nodev)."
@@ -843,7 +884,6 @@ module_hidepid() {
         return
     fi
 
-    # Vérifier si déjà configuré
     if grep -q 'hidepid=' "${fstab}" 2>/dev/null; then
         info "hidepid déjà configuré dans fstab."
         return
@@ -854,10 +894,8 @@ module_hidepid() {
         return
     fi
 
-    # Ajouter au fstab
     echo "proc /proc proc defaults,hidepid=2,gid=sudo 0 0" >> "${fstab}"
 
-    # Remonter immédiatement
     mount -o remount,hidepid=2,gid=sudo /proc 2>/dev/null || {
         warn "Impossible de remonter /proc avec hidepid=2. Sera actif au prochain reboot."
         return
@@ -878,20 +916,19 @@ module_apparmor() {
 
     # Installer AppArmor s'il n'est pas présent
     if ! command -v apparmor_status &>/dev/null && ! command -v aa-status &>/dev/null; then
-        run "${PKG_INSTALL} apparmor apparmor-utils"
+        run apt-get install -y -qq apparmor apparmor-utils
     fi
 
     # S'assurer qu'AppArmor est activé et en enforce
     if [[ "${DRY_RUN}" == false ]]; then
-        run "systemctl enable apparmor"
-        run "systemctl start apparmor"
+        run systemctl enable apparmor
+        run systemctl start apparmor
 
         # Mettre tous les profils en mode enforce
         if command -v aa-enforce &>/dev/null; then
             aa-enforce /etc/apparmor.d/* 2>/dev/null || true
         fi
 
-        # Vérifier le statut
         local profiles_enforced
         profiles_enforced=$(aa-status 2>/dev/null | grep "profiles are in enforce mode" | awk '{print $1}' || echo "0")
         success "AppArmor actif — ${profiles_enforced} profil(s) en mode enforce."
@@ -900,31 +937,299 @@ module_apparmor() {
     fi
 }
 
-# --- 19. Règles auditd ---
+# --- 19. Hardening avancé (recommandations Lynis) ---
+# FIX #3 : déplacé AVANT les règles auditd pour installer auditd en premier
+module_advanced_hardening() {
+    info "━━━ Module 19/20 : Hardening avancé (Lynis) ━━━"
+
+    # --- Paquets de sécurité recommandés ---
+    local lynis_packages=(
+        libpam-tmpdir       # Isole $TMP/$TMPDIR par session PAM
+        libpam-passwdqc     # Politique de force des mots de passe (AUTH-9262)
+        needrestart         # Détecte les daemons nécessitant un restart (DEB-0831)
+        debsums             # Vérification d'intégrité des paquets (PKGS-7370)
+        apt-show-versions   # Gestion des versions pour le patching (PKGS-7394)
+        rkhunter            # Scanner de rootkits (HRDN-7230)
+        aide                # Surveillance d'intégrité des fichiers (FINT-4350)
+        sysstat             # Collecte de métriques système (ACCT-9626)
+    )
+
+    # apt-listbugs n'existe que sur Debian
+    if [[ "${OS_ID}" == "debian" ]]; then
+        lynis_packages+=("apt-listbugs")
+    fi
+
+    # acct et auditd nécessitent un accès kernel — skip en LXC
+    if [[ "${CONTAINER_TYPE}" != "lxc" ]]; then
+        lynis_packages+=("acct" "auditd")
+    fi
+
+    local packages_to_install=()
+    for pkg in "${lynis_packages[@]}"; do
+        if ! dpkg -l "${pkg}" 2>/dev/null | grep -q "^ii"; then
+            if apt-cache show "${pkg}" &>/dev/null; then
+                packages_to_install+=("${pkg}")
+            else
+                info "Paquet ${pkg} non disponible dans les repos — ignoré."
+            fi
+        fi
+    done
+
+    if [[ "${#packages_to_install[@]}" -gt 0 ]]; then
+        info "Installation des paquets de sécurité : ${packages_to_install[*]}"
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages_to_install[@]}"
+    else
+        info "Paquets de sécurité déjà installés."
+    fi
+
+    # Initialiser la base rkhunter si installé
+    if command -v rkhunter &>/dev/null; then
+        rkhunter --propupd 2>/dev/null || true
+    fi
+
+    # Initialiser la base AIDE si installé
+    if command -v aide &>/dev/null; then
+        local aide_excl="/etc/aide/aide.conf.d/00_aide_local_exclusions"
+        if [[ ! -f "${aide_excl}" ]]; then
+            if [[ "${DRY_RUN}" == false ]]; then
+                cat > "${aide_excl}" << 'AIDEEOF'
+# Exclusions locales — générées par post-install-hardening.sh
+!/dev/.lxc
+!/lost+found
+!/mnt/data01
+!/mnt/data02
+AIDEEOF
+            fi
+        fi
+
+        if [[ ! -f /var/lib/aide/aide.db ]]; then
+            if pgrep -f "aideinit|aide.*--config" &>/dev/null; then
+                info "AIDE est déjà en cours d'initialisation."
+            else
+                info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
+                if [[ "${DRY_RUN}" == false ]]; then
+                    nohup aideinit > /var/log/aide-init.log 2>&1 &
+                    info "AIDE PID: $! — Progression dans /var/log/aide-init.log"
+                fi
+            fi
+        fi
+    fi
+
+    # Activer sysstat si installé
+    if [[ -f /etc/default/sysstat ]]; then
+        if [[ "${DRY_RUN}" == false ]]; then
+            sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat
+        fi
+        run systemctl enable --now sysstat 2>/dev/null || true
+    fi
+
+    # Activer acct si installé ET pas en LXC
+    if [[ "${CONTAINER_TYPE}" != "lxc" ]] && command -v accton &>/dev/null; then
+        run systemctl enable --now acct 2>/dev/null || true
+    fi
+
+    # Nettoyer acct/auditd si installés en échec sur un LXC
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        for svc in acct auditd audit-rules; do
+            if systemctl is-failed "${svc}" &>/dev/null 2>&1; then
+                run systemctl disable "${svc}" 2>/dev/null || true
+                run systemctl reset-failed "${svc}" 2>/dev/null || true
+                info "Service ${svc} désactivé (non supporté en LXC)."
+            fi
+        done
+    fi
+
+    # Activer auditd si installé ET pas en LXC
+    if [[ "${CONTAINER_TYPE}" != "lxc" ]] && command -v auditd &>/dev/null; then
+        run systemctl enable --now auditd 2>/dev/null || true
+    fi
+
+    # Configurer debsums pour vérification régulière via cron
+    if [[ -f /etc/default/debsums ]]; then
+        if [[ "${DRY_RUN}" == false ]]; then
+            sed -i 's/^CRON_CHECK=.*/CRON_CHECK=weekly/' /etc/default/debsums 2>/dev/null || true
+            grep -q "^CRON_CHECK" /etc/default/debsums 2>/dev/null || echo "CRON_CHECK=weekly" >> /etc/default/debsums
+        fi
+    fi
+
+    success "Paquets de sécurité installés et configurés."
+
+    # --- Configuration libpam-passwdqc ---
+    local passwdqc_conf="/etc/security/passwdqc.conf"
+    if dpkg -l libpam-passwdqc 2>/dev/null | grep -q "^ii"; then
+        cat << 'PWQCEOF' | write_file "${passwdqc_conf}"
+# Configuration passwdqc — post-install-hardening.sh v2.1
+# Format min=disabled,disabled,disabled,8,8 :
+#   N0 = mots de passe à 1 classe de caractères (désactivé)
+#   N1 = mots de passe à 2 classes (désactivé)
+#   N2 = passphrase (désactivé — on force N3/N4)
+#   N3 = mots de passe à 3 classes (min 8 caractères)
+#   N4 = mots de passe à 4 classes (min 8 caractères)
+min=disabled,disabled,disabled,8,8
+max=256
+passphrase=3
+match=4
+similar=deny
+enforce=everyone
+retry=3
+PWQCEOF
+        success "libpam-passwdqc configuré (min 8 caractères, 3+ classes)."
+    fi
+
+    # --- Bannière légale (BANN-7126 / BANN-7130) ---
+    local banner_text="###############################################################
+#  Unauthorized access to this system is prohibited.          #
+#  All activity may be monitored and reported.                #
+#                                                             #
+#  Acces reserve aux utilisateurs autorises.                  #
+#  Toute activite est susceptible d'etre surveillee.          #
+###############################################################"
+
+    if [[ "${DRY_RUN}" == false ]]; then
+        echo "${banner_text}" > /etc/issue
+        echo "${banner_text}" > /etc/issue.net
+    else
+        info "[DRY-RUN] Écriture bannière légale dans /etc/issue et /etc/issue.net"
+    fi
+    success "Bannière légale configurée (/etc/issue et /etc/issue.net)."
+
+    # --- Hardening Postfix (MAIL-8818) ---
+    if command -v postconf &>/dev/null; then
+        if [[ "${DRY_RUN}" == false ]]; then
+            postconf -e 'smtpd_banner = $myhostname ESMTP'
+            systemctl reload postfix 2>/dev/null || true
+        else
+            info "[DRY-RUN] Hardening bannière Postfix"
+        fi
+        success "Bannière Postfix nettoyée (version masquée)."
+    fi
+
+    # --- Politique de mots de passe (login.defs) ---
+    local login_defs="/etc/login.defs"
+    if [[ -f "${login_defs}" ]]; then
+        _set_login_defs() {
+            local key="$1" value="$2"
+            if grep -q "^${key}" "${login_defs}" 2>/dev/null; then
+                sed -i "s|^${key}.*|${key}    ${value}|" "${login_defs}"
+            elif grep -q "^#.*${key}" "${login_defs}" 2>/dev/null; then
+                sed -i "s|^#.*${key}.*|${key}    ${value}|" "${login_defs}"
+            else
+                echo "${key}    ${value}" >> "${login_defs}"
+            fi
+        }
+
+        if [[ "${DRY_RUN}" == false ]]; then
+            _set_login_defs "UMASK" "027"
+            _set_login_defs "PASS_MIN_DAYS" "1"
+            _set_login_defs "PASS_MAX_DAYS" "365"
+            _set_login_defs "SHA_CRYPT_MIN_ROUNDS" "5000"
+            _set_login_defs "SHA_CRYPT_MAX_ROUNDS" "5000"
+        fi
+
+        success "Politique de mots de passe renforcée (login.defs)."
+    fi
+
+    # --- Désactivation des protocoles réseau inutiles ---
+    local modprobe_conf="/etc/modprobe.d/hardening.conf"
+    if [[ ! -f "${modprobe_conf}" ]]; then
+        cat << 'MODEOF' | write_file "${modprobe_conf}"
+# Protocoles réseau inutiles — désactivés par post-install-hardening.sh
+install dccp /bin/true
+install sctp /bin/true
+install rds /bin/true
+install tipc /bin/true
+# Stockage externe
+install usb-storage /bin/true
+install firewire-core /bin/true
+MODEOF
+        success "Protocoles réseau et stockage USB/FireWire désactivés."
+    else
+        info "Hardening modprobe déjà en place."
+    fi
+
+    # --- Permissions restrictives sur les fichiers sensibles ---
+    local sensitive_files=(
+        "/etc/crontab:600"
+        "/etc/ssh/sshd_config:600"
+        "/etc/shadow:640"
+    )
+
+    for entry in "${sensitive_files[@]}"; do
+        local filepath="${entry%%:*}"
+        local perms="${entry##*:}"
+        if [[ -f "${filepath}" ]]; then
+            local current_perms
+            current_perms=$(stat -c "%a" "${filepath}" 2>/dev/null || echo "")
+            if [[ "${current_perms}" != "${perms}" ]]; then
+                run chmod "${perms}" "${filepath}"
+            fi
+        fi
+    done
+
+    # Restreindre l'accès aux compilateurs si présents
+    for compiler in /usr/bin/gcc /usr/bin/g++ /usr/bin/cc; do
+        if [[ -f "${compiler}" && ! -L "${compiler}" ]]; then
+            local current_perms
+            current_perms=$(stat -c "%a" "${compiler}" 2>/dev/null || echo "")
+            if [[ "${current_perms}" != "700" ]]; then
+                run chmod 700 "${compiler}"
+            fi
+        fi
+    done
+
+    success "Permissions restrictives appliquées."
+
+    # --- Profil Lynis custom pour LXC (faux positifs) ---
+    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
+        local lynis_prf="/etc/lynis/custom.prf"
+        run mkdir -p /etc/lynis
+        cat << 'LYNISEOF' | write_file "${lynis_prf}"
+# Profil Lynis custom — faux positifs LXC
+# Généré par post-install-hardening.sh
+
+# iptables chargé par le host mais pas de règles dans le conteneur (normal)
+skip-test=FIRE-4512
+
+# Pas de kernel propre en LXC
+skip-test=KRNL-5788
+skip-test=KRNL-5830
+
+# sysctl géré par le host
+skip-test=KRNL-6000
+
+# Pas de boot propre en LXC
+skip-test=BOOT-5180
+
+# Partitions séparées non pertinentes en LXC
+skip-test=FILE-6310
+LYNISEOF
+        success "Profil Lynis LXC configuré (faux positifs ignorés)."
+    fi
+
+    success "Hardening avancé terminé."
+}
+
+# --- 20. Règles auditd ---
+# FIX #3 : exécuté APRÈS module_advanced_hardening qui installe auditd
 module_auditd_rules() {
-    info "━━━ Module 19/20 : Règles auditd ━━━"
+    info "━━━ Module 20/20 : Règles auditd ━━━"
 
     if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
         warn "Environnement LXC : auditd non supporté. Module ignoré."
         return
     fi
 
-    # auditd est installé dans le module advanced_hardening, vérifier qu'il est présent
+    # auditd doit maintenant être installé par module_advanced_hardening
     if ! command -v auditd &>/dev/null; then
-        info "auditd non installé. Les règles seront appliquées si auditd est installé par le module avancé."
+        warn "auditd non installé. Module ignoré."
         return
     fi
 
     local rules_file="/etc/audit/rules.d/99-hardening.rules"
 
-    if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] Création des règles auditd dans ${rules_file}"
-        return
-    fi
-
-    cat > "${rules_file}" << 'AUDITEOF'
+    cat << 'AUDITEOF' | write_file "${rules_file}"
 # =============================================================================
-# Règles auditd — post-install-hardening.sh v2
+# Règles auditd — post-install-hardening.sh v2.1
 # Basées sur les recommandations CIS et STIG
 # =============================================================================
 
@@ -974,292 +1279,18 @@ module_auditd_rules() {
 -e 2
 AUDITEOF
 
-    chmod 640 "${rules_file}"
+    if [[ "${DRY_RUN}" == false ]]; then
+        chmod 640 "${rules_file}"
 
-    # Recharger les règles
-    augenrules --load 2>/dev/null || auditctl -R "${rules_file}" 2>/dev/null || true
+        # Recharger les règles
+        augenrules --load 2>/dev/null || auditctl -R "${rules_file}" 2>/dev/null || true
 
-    local rule_count
-    rule_count=$(auditctl -l 2>/dev/null | wc -l || echo "0")
-    success "Règles auditd déployées (${rule_count} règles actives)."
-}
-
-# --- 20. Hardening avancé (recommandations Lynis) ---
-module_advanced_hardening() {
-    info "━━━ Module 20/20 : Hardening avancé (Lynis) ━━━"
-
-    # --- Paquets de sécurité recommandés ---
-    local lynis_packages=(
-        libpam-tmpdir       # Isole $TMP/$TMPDIR par session PAM
-        libpam-passwdqc     # Politique de force des mots de passe (AUTH-9262)
-        needrestart         # Détecte les daemons nécessitant un restart (DEB-0831)
-        debsums             # Vérification d'intégrité des paquets (PKGS-7370)
-        apt-show-versions   # Gestion des versions pour le patching (PKGS-7394)
-        rkhunter            # Scanner de rootkits (HRDN-7230)
-        aide                # Surveillance d'intégrité des fichiers (FINT-4350)
-        sysstat             # Collecte de métriques système (ACCT-9626)
-    )
-
-    # apt-listbugs n'existe que sur Debian
-    if [[ "${OS_ID}" == "debian" ]]; then
-        lynis_packages+=("apt-listbugs")
-    fi
-
-    # acct et auditd nécessitent un accès kernel — skip en LXC
-    if [[ "${CONTAINER_TYPE}" != "lxc" ]]; then
-        lynis_packages+=("acct" "auditd")
-    fi
-
-    local packages_to_install=()
-    for pkg in "${lynis_packages[@]}"; do
-        if ! dpkg -l "${pkg}" 2>/dev/null | grep -q "^ii"; then
-            if apt-cache show "${pkg}" &>/dev/null; then
-                packages_to_install+=("${pkg}")
-            else
-                info "Paquet ${pkg} non disponible dans les repos — ignoré."
-            fi
-        fi
-    done
-
-    if [[ "${#packages_to_install[@]}" -gt 0 ]]; then
-        info "Installation des paquets de sécurité : ${packages_to_install[*]}"
-        run "DEBIAN_FRONTEND=noninteractive apt-get install -y ${packages_to_install[*]}"
+        local rule_count
+        rule_count=$(auditctl -l 2>/dev/null | grep -v "^No rules" | wc -l)
+        success "Règles auditd déployées (${rule_count} règles actives)."
     else
-        info "Paquets de sécurité déjà installés."
+        success "[DRY-RUN] Règles auditd préparées."
     fi
-
-    # Initialiser la base rkhunter si installé
-    if command -v rkhunter &>/dev/null; then
-        run "rkhunter --propupd" 2>/dev/null || true
-    fi
-
-    # Initialiser la base AIDE si installé
-    if command -v aide &>/dev/null; then
-        local aide_excl="/etc/aide/aide.conf.d/00_aide_local_exclusions"
-        if [[ ! -f "${aide_excl}" ]]; then
-            if [[ "${DRY_RUN}" == false ]]; then
-                cat > "${aide_excl}" << 'AIDEEOF'
-# Exclusions locales — générées par post-install-hardening.sh
-!/dev/.lxc
-!/lost+found
-!/mnt/data01
-!/mnt/data02
-AIDEEOF
-            fi
-        fi
-
-        if [[ ! -f /var/lib/aide/aide.db ]]; then
-            if pgrep -f "aideinit|aide.*--config" &>/dev/null; then
-                info "AIDE est déjà en cours d'initialisation."
-            else
-                info "Initialisation de la base AIDE en arrière-plan (peut prendre 10-30 min)..."
-                if [[ "${DRY_RUN}" == false ]]; then
-                    nohup aideinit > /var/log/aide-init.log 2>&1 &
-                    info "AIDE PID: $! — Progression dans /var/log/aide-init.log"
-                fi
-            fi
-        fi
-    fi
-
-    # Activer sysstat si installé
-    if [[ -f /etc/default/sysstat ]]; then
-        run "sed -i 's/ENABLED=\"false\"/ENABLED=\"true\"/' /etc/default/sysstat"
-        run "systemctl enable --now sysstat" 2>/dev/null || true
-    fi
-
-    # Activer acct si installé ET pas en LXC
-    if [[ "${CONTAINER_TYPE}" != "lxc" ]] && command -v accton &>/dev/null; then
-        run "systemctl enable --now acct" 2>/dev/null || true
-    fi
-
-    # Nettoyer acct/auditd si installés en échec sur un LXC
-    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
-        for svc in acct auditd audit-rules; do
-            if systemctl is-failed "${svc}" &>/dev/null 2>&1; then
-                run "systemctl disable ${svc}" 2>/dev/null || true
-                run "systemctl reset-failed ${svc}" 2>/dev/null || true
-                info "Service ${svc} désactivé (non supporté en LXC)."
-            fi
-        done
-    fi
-
-    # Activer auditd si installé ET pas en LXC
-    if [[ "${CONTAINER_TYPE}" != "lxc" ]] && command -v auditd &>/dev/null; then
-        run "systemctl enable --now auditd" 2>/dev/null || true
-    fi
-
-    # Configurer debsums pour vérification régulière via cron
-    if [[ -f /etc/default/debsums ]]; then
-        if [[ "${DRY_RUN}" == false ]]; then
-            sed -i 's/^CRON_CHECK=.*/CRON_CHECK=weekly/' /etc/default/debsums 2>/dev/null || true
-            grep -q "^CRON_CHECK" /etc/default/debsums 2>/dev/null || echo "CRON_CHECK=weekly" >> /etc/default/debsums
-        fi
-    fi
-
-    success "Paquets de sécurité installés et configurés."
-
-    # --- Configuration libpam-passwdqc ---
-    local passwdqc_conf="/etc/security/passwdqc.conf"
-    if dpkg -l libpam-passwdqc 2>/dev/null | grep -q "^ii"; then
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Configuration libpam-passwdqc"
-        else
-            cat > "${passwdqc_conf}" << 'PWQCEOF'
-# Configuration passwdqc — post-install-hardening.sh v2
-# Format min=disabled,disabled,disabled,8,8 :
-#   N0 = mots de passe à 1 classe de caractères (désactivé)
-#   N1 = mots de passe à 2 classes (désactivé)
-#   N2 = passphrase (désactivé — on force N3/N4)
-#   N3 = mots de passe à 3 classes (min 8 caractères)
-#   N4 = mots de passe à 4 classes (min 8 caractères)
-min=disabled,disabled,disabled,8,8
-max=256
-passphrase=3
-match=4
-similar=deny
-enforce=everyone
-retry=3
-PWQCEOF
-            success "libpam-passwdqc configuré (min 8 caractères, 3+ classes)."
-        fi
-    fi
-
-    # --- Bannière légale (BANN-7126 / BANN-7130) ---
-    local banner_text="###############################################################
-#  Unauthorized access to this system is prohibited.          #
-#  All activity may be monitored and reported.                #
-#                                                             #
-#  Acces reserve aux utilisateurs autorises.                  #
-#  Toute activite est susceptible d'etre surveillee.          #
-###############################################################"
-
-    if [[ "${DRY_RUN}" == true ]]; then
-        info "[DRY-RUN] Écriture bannière légale dans /etc/issue et /etc/issue.net"
-    else
-        echo "${banner_text}" > /etc/issue
-        echo "${banner_text}" > /etc/issue.net
-    fi
-    success "Bannière légale configurée (/etc/issue et /etc/issue.net)."
-
-    # --- Hardening Postfix (MAIL-8818) ---
-    # Supprimer la version de Postfix de la bannière SMTP
-    if command -v postconf &>/dev/null; then
-        if [[ "${DRY_RUN}" == true ]]; then
-            info "[DRY-RUN] Hardening bannière Postfix"
-        else
-            postconf -e 'smtpd_banner = $myhostname ESMTP'
-            systemctl reload postfix 2>/dev/null || true
-        fi
-        success "Bannière Postfix nettoyée (version masquée)."
-    fi
-
-    # --- Politique de mots de passe (login.defs) ---
-    local login_defs="/etc/login.defs"
-    if [[ -f "${login_defs}" ]]; then
-        _set_login_defs() {
-            local key="$1" value="$2"
-            if grep -q "^${key}" "${login_defs}" 2>/dev/null; then
-                sed -i "s|^${key}.*|${key}    ${value}|" "${login_defs}"
-            elif grep -q "^#.*${key}" "${login_defs}" 2>/dev/null; then
-                sed -i "s|^#.*${key}.*|${key}    ${value}|" "${login_defs}"
-            else
-                echo "${key}    ${value}" >> "${login_defs}"
-            fi
-        }
-
-        if [[ "${DRY_RUN}" == false ]]; then
-            _set_login_defs "UMASK" "027"
-            _set_login_defs "PASS_MIN_DAYS" "1"
-            _set_login_defs "PASS_MAX_DAYS" "365"
-            _set_login_defs "SHA_CRYPT_MIN_ROUNDS" "5000"
-            _set_login_defs "SHA_CRYPT_MAX_ROUNDS" "5000"
-        fi
-
-        success "Politique de mots de passe renforcée (login.defs)."
-    fi
-
-    # --- Désactivation des protocoles réseau inutiles ---
-    local modprobe_conf="/etc/modprobe.d/hardening.conf"
-    if [[ ! -f "${modprobe_conf}" ]]; then
-        if [[ "${DRY_RUN}" == false ]]; then
-            cat > "${modprobe_conf}" << 'MODEOF'
-# Protocoles réseau inutiles — désactivés par post-install-hardening.sh
-install dccp /bin/true
-install sctp /bin/true
-install rds /bin/true
-install tipc /bin/true
-# Stockage externe
-install usb-storage /bin/true
-install firewire-core /bin/true
-MODEOF
-        fi
-        success "Protocoles réseau et stockage USB/FireWire désactivés."
-    else
-        info "Hardening modprobe déjà en place."
-    fi
-
-    # --- Permissions restrictives sur les fichiers sensibles ---
-    local sensitive_files=(
-        "/etc/crontab:600"
-        "/etc/ssh/sshd_config:600"
-        "/etc/shadow:640"
-    )
-
-    for entry in "${sensitive_files[@]}"; do
-        local filepath="${entry%%:*}"
-        local perms="${entry##*:}"
-        if [[ -f "${filepath}" ]]; then
-            local current_perms
-            current_perms=$(stat -c "%a" "${filepath}" 2>/dev/null || echo "")
-            if [[ "${current_perms}" != "${perms}" ]]; then
-                run "chmod ${perms} '${filepath}'"
-            fi
-        fi
-    done
-
-    # Restreindre l'accès aux compilateurs si présents
-    for compiler in /usr/bin/gcc /usr/bin/g++ /usr/bin/cc; do
-        if [[ -f "${compiler}" && ! -L "${compiler}" ]]; then
-            local current_perms
-            current_perms=$(stat -c "%a" "${compiler}" 2>/dev/null || echo "")
-            if [[ "${current_perms}" != "700" ]]; then
-                run "chmod 700 '${compiler}'"
-            fi
-        fi
-    done
-
-    success "Permissions restrictives appliquées."
-
-    # --- Profil Lynis custom pour LXC (faux positifs) ---
-    if [[ "${CONTAINER_TYPE}" == "lxc" ]]; then
-        local lynis_prf="/etc/lynis/custom.prf"
-        run "mkdir -p /etc/lynis"
-        if [[ "${DRY_RUN}" == false ]]; then
-            cat > "${lynis_prf}" << 'LYNISEOF'
-# Profil Lynis custom — faux positifs LXC
-# Généré par post-install-hardening.sh
-
-# iptables chargé par le host mais pas de règles dans le conteneur (normal)
-skip-test=FIRE-4512
-
-# Pas de kernel propre en LXC
-skip-test=KRNL-5788
-skip-test=KRNL-5830
-
-# sysctl géré par le host
-skip-test=KRNL-6000
-
-# Pas de boot propre en LXC
-skip-test=BOOT-5180
-
-# Partitions séparées non pertinentes en LXC
-skip-test=FILE-6310
-LYNISEOF
-            success "Profil Lynis LXC configuré (faux positifs ignorés)."
-        fi
-    fi
-
-    success "Hardening avancé terminé."
 }
 
 # --- Stamp de version ---
@@ -1279,6 +1310,8 @@ user=${ADMIN_USER}
 ssh_port=${SSH_PORT}
 os=${OS_NAME}
 type=${CONTAINER_TYPE}
+forwarding=${ENABLE_FORWARDING}
+nopasswd_sudo=${NOPASSWD_SUDO}
 STAMPEOF
 
     chmod 644 "${HARDENING_STAMP}"
@@ -1316,7 +1349,8 @@ module_notify_discord() {
       { "name": "👤 Admin",     "value": "\`${ADMIN_USER}\`",      "inline": true },
       { "name": "🔑 SSH port",  "value": "\`${SSH_PORT}\`",        "inline": true },
       { "name": "📦 OS",        "value": "${OS_NAME}",             "inline": true },
-      { "name": "🏷 Version",   "value": "v${SCRIPT_VERSION}",     "inline": true }
+      { "name": "🏷 Version",   "value": "v${SCRIPT_VERSION}",     "inline": true },
+      { "name": "🔀 Forwarding","value": "${ENABLE_FORWARDING}",   "inline": true }
     ],
     "footer": { "text": "post-install-hardening.sh" },
     "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1373,6 +1407,8 @@ print_summary() {
     echo -e "${GREEN}║${NC} IP            : ${ip_addr}"
     echo -e "${GREEN}║${NC} Utilisateur   : ${ADMIN_USER}"
     echo -e "${GREEN}║${NC} Port SSH      : ${SSH_PORT}"
+    echo -e "${GREEN}║${NC} Sudo NOPASSWD : ${NOPASSWD_SUDO}"
+    echo -e "${GREEN}║${NC} IP Forwarding : ${ENABLE_FORWARDING}"
     echo -e "${GREEN}║${NC} Fail2ban      : ${ENABLE_FAIL2BAN}"
     echo -e "${GREEN}║${NC} UFW           : ${ufw_status}"
     echo -e "${GREEN}║${NC} Sysctl        : ${sysctl_status}"
@@ -1432,8 +1468,9 @@ main() {
     module_secure_mounts
     module_hidepid
     module_apparmor
-    module_auditd_rules
+    # FIX #3 : advanced_hardening (installe auditd) AVANT auditd_rules
     module_advanced_hardening
+    module_auditd_rules
     module_write_version_stamp
     module_notify_discord
 
