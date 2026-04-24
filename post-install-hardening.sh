@@ -30,7 +30,7 @@ set -euo pipefail
 # CONSTANTES & CONFIGURATION PAR DÉFAUT
 # =============================================================================
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly LOG_FILE="/var/log/post-install-hardening.log"
 readonly SYSCTL_HARDENING_FILE="/etc/sysctl.d/99-hardening.conf"
 readonly SSH_CONFIG="/etc/ssh/sshd_config"
@@ -54,6 +54,8 @@ ENABLE_UFW=true
 ENABLE_UNATTENDED=true
 ENABLE_DISCORD=false
 ENABLE_FORWARDING=false
+LOOSE_RPFILTER=false
+ENABLE_BBR=true
 NOPASSWD_SUDO=false
 DRY_RUN=false
 
@@ -172,6 +174,8 @@ Options :
   -d, --discord               Notification Discord (webhook) à la fin
   --nopasswd-sudo             Autoriser sudo sans mot de passe (déconseillé)
   --enable-forwarding         Ne pas désactiver ip_forward (nécessaire pour VPN/routeur)
+  --loose-rpfilter            rp_filter=2 au lieu de 1 (routeurs avec policy routing asymétrique)
+  --no-bbr                    Ne pas activer BBR + fq_codel (activé par défaut)
   --no-fail2ban               Désactiver l'installation de fail2ban
   --no-ufw                    Désactiver la configuration UFW
   --no-unattended             Désactiver unattended-upgrades
@@ -231,6 +235,8 @@ parse_args() {
             -d|--discord)           ENABLE_DISCORD=true;     shift ;;
             --nopasswd-sudo)        NOPASSWD_SUDO=true;      shift ;;
             --enable-forwarding)    ENABLE_FORWARDING=true;  shift ;;
+            --loose-rpfilter)       LOOSE_RPFILTER=true;     shift ;;
+            --no-bbr)               ENABLE_BBR=false;        shift ;;
             --no-fail2ban)          ENABLE_FAIL2BAN=false;   shift ;;
             --no-ufw)              ENABLE_UFW=false;         shift ;;
             --no-unattended)        ENABLE_UNATTENDED=false; shift ;;
@@ -602,6 +608,14 @@ module_harden_sysctl() {
     fi
 
     # FIX #5 : ip_forward conditionnel pour VPN/routeur
+    # FIX #8 : rp_filter conditionnel pour policy routing asymétrique
+    # FIX #9 : BBR + fq_codel activables (défaut: activé)
+    # FIX #10 : warn() déplacé hors du heredoc (évite la pollution du fichier sysctl)
+    local rpfilter_mode=1
+    if [[ "${LOOSE_RPFILTER}" == true ]]; then
+        rpfilter_mode=2
+    fi
+
     {
         cat << 'SYSCTLEOF'
 # =============================================================================
@@ -628,9 +642,16 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 
-# Reverse path filtering (anti-spoofing)
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
+SYSCTLEOF
+
+        # Reverse path filtering : 1=strict, 2=loose (asymétrique)
+        cat << RPFEOF
+# Reverse path filtering (anti-spoofing) — mode ${rpfilter_mode}
+net.ipv4.conf.all.rp_filter = ${rpfilter_mode}
+net.ipv4.conf.default.rp_filter = ${rpfilter_mode}
+RPFEOF
+
+        cat << 'SYSCTLEOF2'
 
 # Smurf protection
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -653,7 +674,17 @@ net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
-SYSCTLEOF
+SYSCTLEOF2
+
+        # BBR + fq_codel : amélioration TCP (latence + throughput)
+        if [[ "${ENABLE_BBR}" == true ]]; then
+            cat << 'BBREOF'
+
+# --- BBR + fq_codel (congestion control moderne) ---
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq_codel
+BBREOF
+        fi
 
         # ip_forward : conditionnel selon l'option --enable-forwarding
         if [[ "${ENABLE_FORWARDING}" == true ]]; then
@@ -663,7 +694,6 @@ SYSCTLEOF
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 FWDEOF
-            warn "ip_forward ACTIVÉ (option --enable-forwarding). Nécessaire pour VPN/routeur."
         else
             cat << 'NOFWDEOF'
 
@@ -673,6 +703,18 @@ net.ipv6.conf.all.forwarding = 0
 NOFWDEOF
         fi
     } | write_file "${SYSCTL_HARDENING_FILE}"
+
+    # FIX #10 : warn() APRÈS write_file (hors du pipe stdout), pour éviter
+    # que le message n'atterrisse dans le fichier de config sysctl.
+    if [[ "${ENABLE_FORWARDING}" == true ]]; then
+        warn "ip_forward ACTIVÉ (option --enable-forwarding). Nécessaire pour VPN/routeur."
+    fi
+    if [[ "${LOOSE_RPFILTER}" == true ]]; then
+        warn "rp_filter en mode LOOSE (=2). Nécessaire pour policy routing asymétrique."
+    fi
+    if [[ "${ENABLE_BBR}" == true ]]; then
+        info "BBR + fq_codel activés (amélioration TCP latence/throughput)."
+    fi
 
     if [[ "${DRY_RUN}" == false ]]; then
         sysctl --system > /dev/null 2>&1
